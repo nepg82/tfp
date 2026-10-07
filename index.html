@@ -91,6 +91,12 @@
           <label class="check"><input id="rememberPassword" type="checkbox"> Remember password on this device</label>
           <p class="warning">If you forget this password, an encrypted GitHub backup cannot be decrypted.</p>
         </div>
+        <div class="panel">
+          <h2>Expense Categories</h2>
+          <p class="hint">Create your own categories. They will appear in the Expense entry dropdown.</p>
+          <div class="category-add"><input id="newCategory" placeholder="e.g. Advertising" autocomplete="off"><button id="addCategoryBtn" class="primary-btn">Add</button></div>
+          <div id="categoryList" class="category-list"></div>
+        </div>
         <div class="panel full">
           <h2>Local Data</h2>
           <div class="toolbar">
@@ -112,7 +118,7 @@
   <form method="dialog" id="entryForm" class="dialog-form">
     <div class="dialog-title"><span id="dialogTitle">New Entry</span><button value="cancel" class="close-btn">×</button></div>
     <div id="entryFields"></div>
-    <div class="dialog-actions"><button value="cancel">Cancel</button><button id="saveEntryBtn" value="default" class="primary-btn">Save</button></div>
+    <div class="dialog-actions"><button type="button" id="cancelEntryBtn">Cancel</button><button id="saveEntryBtn" value="default" class="primary-btn">Save</button></div>
   </form>
 </dialog>
 
