@@ -194,3 +194,12 @@ Private GitHub repository
 The GitHub repository's normal Git history also provides historical versions of the encrypted ledger file. Because the file is encrypted, those historical versions do not contain readable ledger information.
 
 The app's **Export encrypted backup** function provides an additional standalone backup file.
+
+## v1.0.2 changes
+
+- Register now displays Gross Charges, Expenses, and Revenue Reduction.
+- Expense category is visible in the Register.
+- Register supports filtering by type and category, text search, and sorting by date, type, description, category, or amount.
+- Statement preview uses a bank-statement-style transaction table with Gross Charges, Expenses, and Revenue Reduction columns.
+- Statement expense detail is grouped by category; categories with no expenses are omitted.
+- PDF statements use the same layout and can span multiple pages.
