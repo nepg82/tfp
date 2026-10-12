@@ -6,23 +6,62 @@ A small, installable Progressive Web App for tracking True Faith Psychiatry busi
 
 The app is designed for GitHub Pages. The application can live in a **public repository**, while the ledger itself is stored as an **encrypted file in a separate private GitHub repository**.
 
+## Contents
+
+1. [What it stores](#what-it-stores)
+2. [How the numbers work](#how-the-numbers-work)
+3. [Setup](#setup)
+4. [Daily use](#daily-use)
+5. [Using multiple devices](#using-multiple-devices)
+6. [Statements](#statements)
+7. [Backups, import, and export](#backups-import-and-export)
+8. [Security notes](#security-notes)
+9. [Troubleshooting](#troubleshooting)
+10. [For developers](#for-developers)
+11. [Changelog](#changelog)
+
+---
+
 ## What it stores
 
-- Income received directly, such as cash deposits
-- Expenses, with an optional category
-- Insurance billing records:
+- **Income** received directly, such as cash deposits
+- **Expenses**, each assigned to a category
+- **Insurance billing records:**
   - service date
   - payment date
-  - amount billed
+  - amount billed (gross charges)
   - amount actually received
-  - automatically calculated insurance shortfall
-- Date-range statements
-- Local IndexedDB working data
-- Encrypted GitHub backups/synchronization
+  - automatically calculated revenue reduction (the insurance shortfall)
+- **Expense categories** (your own list, see [Expense categories](#expense-categories))
+- Local working data in the browser (IndexedDB)
+- Encrypted GitHub backups and synchronization
 
 No patient names, account numbers, or other patient identifiers are required by the data model.
 
-## 1. Create the public application repository
+## How the numbers work
+
+The same terms are used in the Register, the Billing tab, and statements.
+
+| Term | Meaning |
+| --- | --- |
+| **Gross Charges** | For billing records, the amount billed. For income, the amount received. |
+| **Expenses** | Money spent. |
+| **Revenue Reduction** | For billing records, amount billed minus amount received (never below zero). |
+| **Net Revenue** | Gross Charges minus Revenue Reduction. |
+| **Net Income** | Net Revenue minus Expenses. |
+| **Balance** (Register only) | Running cash total: income and insurance payments received, minus expenses. |
+
+Things worth knowing:
+
+- A billing record counts on its **payment date**, not its service date. This applies to the Register, to statements, and to date ranges.
+- Amount received can't be more than the amount billed, and amounts can't be negative.
+- The Register's running Balance is always calculated over *all* records in date order, so it stays correct when you filter or re-sort the table.
+
+---
+
+## Setup
+
+### 1. Create the public application repository
 
 Create a new **public** GitHub repository for the application. A suggested name is:
 
@@ -45,7 +84,7 @@ app-icons/app-icon-512.png
 
 Replace the two icon files with your own icons. The app is already configured for those exact paths.
 
-### Enable GitHub Pages
+#### Enable GitHub Pages
 
 In the public repository:
 
@@ -57,7 +96,7 @@ In the public repository:
 
 GitHub will provide the Pages URL for the app.
 
-## 2. Create the private data repository
+### 2. Create the private data repository
 
 Create a second repository. Suggested name:
 
@@ -65,11 +104,13 @@ Create a second repository. Suggested name:
 
 Set this repository to **Private**.
 
-It can start completely empty. The app will create `ledger.enc` the first time you push the ledger.
+Tips:
 
-Do not put application source code in this repository. It is intended to contain the encrypted ledger data only.
+- The app creates `ledger.enc` the first time you push, so the repository doesn't need to contain anything.
+- Its default branch must be named **`main`**. The app always writes to `main`. Initializing the repository with a README when you create it is an easy way to make sure the branch exists.
+- Do not put application source code in this repository. It is intended to contain the encrypted ledger data only.
 
-## 3. Create a GitHub fine-grained token
+### 3. Create a GitHub fine-grained token
 
 The app talks directly to GitHub's REST API from the browser.
 
@@ -87,11 +128,13 @@ GitHub documents fine-grained token permissions here:
 
 https://docs.github.com/en/rest/authentication/permissions-required-for-fine-grained-personal-access-tokens
 
-The repository Contents API used by this app supports fine-grained tokens with Contents permission.
+The repository Contents API used by this app supports fine-grained tokens with Contents permission:
 
 https://docs.github.com/en/rest/repos/contents
 
-## 4. Configure TFP Ledger
+Fine-grained tokens expire. When yours does, Push and Pull will start failing with a 401 error and you'll need to create a new token and paste it into Settings.
+
+### 4. Configure TFP Ledger
 
 Open the deployed PWA and go to **Settings**.
 
@@ -103,80 +146,105 @@ Enter:
 - **Fine-grained token:** the token created above
 - **Encryption password:** a password used to encrypt the ledger before it leaves the browser
 
-### Encryption password
+Settings are saved automatically when you change a field.
 
-The ledger is encrypted in the browser with AES-256-GCM. A key is derived from the encryption password using PBKDF2-SHA256.
+#### Encryption password
+
+The ledger is encrypted in the browser with AES-256-GCM. A key is derived from the encryption password using PBKDF2-SHA256 (210,000 iterations).
 
 **The encryption password is never sent to GitHub.**
 
 The same encryption password must be entered on every device that needs to read the ledger.
 
-If the encryption password is lost, the encrypted GitHub backup cannot be decrypted.
+If the encryption password is lost, the encrypted GitHub backup cannot be decrypted. There is no recovery option.
 
-The app offers optional "Remember" checkboxes for the GitHub token and encryption password. Leaving them unchecked is more secure, but means they must be entered again on that device.
+The app offers optional "Remember" checkboxes for the GitHub token and encryption password. Leaving them unchecked is more secure, but means they must be entered again each time on that device. See [Security notes](#security-notes) for how remembered values are stored.
 
-## 5. Using multiple devices
+### 5. Install the app (optional)
 
-Each device has its own local IndexedDB copy.
+TFP Ledger is a PWA. In most browsers you can install it from the address bar (desktop) or the share/menu button ("Add to Home Screen" on phones). After the first load it also works offline.
+
+---
+
+## Daily use
+
+The app has four tabs:
+
+- **Register:** every transaction in one table, with summary totals across the top.
+- **Billing:** insurance billing records only.
+- **Statements:** pick a date range and preview or download a statement.
+- **Settings:** GitHub sync, encryption, expense categories, and local data tools.
+
+### Adding and editing entries
+
+Use the **+ Income**, **+ Expense**, and **+ Billing Payment** buttons on the Register (or **+ New Billing** on the Billing tab). Each row has **Edit** and **Delete** buttons.
+
+Deleting asks for confirmation. A deleted record is replaced internally by a "tombstone" so the deletion can synchronize to other devices.
+
+### Filtering the Register
+
+The Register can be filtered by type (Income / Expenses / Billing) and by category, searched by description, and sorted by date, type, description, category, or amount. The sort-direction button reverses the order, and **Clear** resets everything.
+
+### Expense categories
+
+Manage categories in **Settings → Expense Categories**. They appear in the Expense form and the Register's category filter.
+
+- A starter list is provided (Fees, Advertising, Office Supplies, Software, Professional Services, Rent, Utilities, Insurance, Travel, Other).
+- Deleting a category does not change existing expenses; they keep their category text.
+- **The category list is stored per device and is not part of the GitHub sync.** Records synchronize with their category names, but on a new device you'll see the starter list until you add your own categories there. Expenses with a category that isn't in the list still display and still appear on statements, but you must add the category to filter by it.
+
+### The sync status bar
+
+The bar under the tabs shows the current state: *Local only*, *Unsynced local changes*, *Synced*, *Pulled + merged*, or *Sync error*. Along with the title bar and tabs, it stays visible while you scroll.
+
+---
+
+## Using multiple devices
+
+Each device has its own local copy of the ledger (in the browser's IndexedDB).
 
 - **Pull** downloads the encrypted GitHub ledger and merges it with the local copy.
-- **Push** first checks the GitHub copy, merges records, and then uploads the merged encrypted ledger.
+- **Push** first checks the GitHub copy, merges records, saves the merged result locally, and then uploads the merged encrypted ledger.
 - New records have unique IDs, so additions made on different devices can be merged.
-- Deleted records are represented internally as tombstones so a deletion can synchronize to another device.
+- If the same record was edited on two devices, the **most recently edited version wins**. If the timestamps are identical, the GitHub version wins.
+- Deleted records are represented as tombstones so a deletion can synchronize to another device.
 
 For normal use, a good habit is:
 
-1. Pull when starting work on a second device.
+1. **Pull** when starting work on a second device.
 2. Enter transactions.
-3. Push when finished.
+3. **Push** when finished.
 
-The app also keeps the local copy so it can be used when GitHub is temporarily unavailable.
+Avoid pushing from two devices at the same moment. If GitHub rejects a push because the file changed in the meantime, simply try again.
 
-## 6. Statements
+The app keeps working from the local copy when GitHub is unavailable.
 
-Go to **Statements**, select the beginning and ending dates, and choose **Create PDF Statement**.
+---
 
-The statement includes:
+## Statements
 
-- Insurance payments received
-- Other income received
-- Actual income received
-- Insurance amount billed
-- Insurance shortfall
-- Expenses
-- Net cash movement
-- A transaction listing
+Go to **Statements** and choose **From** and **Through** dates (both inclusive). A live preview appears below. Choose **Create PDF Statement** to download it.
 
-The PDF is generated locally in the browser.
+By default the range is the first of the current month through today.
 
-## 7. Important security notes
+A statement contains:
 
-This application is intended to avoid storing patient identifiers, but it still contains sensitive business financial information.
+- **Transactions:** every record in the range, in date order, with Gross Charges, Expenses, and Revenue Reduction columns
+- **Expense detail:** expenses grouped by category, with a total for each. Categories with no expenses in the range are omitted.
+- **Summary:** Gross Charges, Revenue Reduction, Net Revenue, Total Expenses, and Net Income
 
-The important protections are:
+The PDF is generated locally in the browser and uses the same layout as the preview, spanning multiple pages if needed.
 
-- Keep the data repository **private**.
-- Use a fine-grained token restricted to that one repository.
-- Do not commit a GitHub token to the public application repository.
-- Do not put plaintext ledger files into the data repository.
-- Use a strong encryption password.
-- Do not use patient names or other unnecessary identifying information in transaction descriptions.
+PDF limitations:
 
-The GitHub token is stored only in the browser when the user chooses to remember it. The encryption password is used locally to decrypt/encrypt the ledger.
+- The PDF uses a basic built-in font, so characters outside plain English letters, numbers, and punctuation (accented letters, curly quotes, emoji) print as `?`.
+- Long descriptions are shortened (about 31 characters in the transactions list and 42 in the expense detail). The on-screen preview shows full text.
 
-## 8. Service-worker cache version
+---
 
-If you make a deployed application change and the browser appears to keep running an older version, increment the cache name at the top of `sw.js`:
+## Backups, import, and export
 
-```js
-const CACHE = 'tfp-ledger-v1.0.1';
-```
-
-The current package starts at `v1.0.0`.
-
-## 9. Backup philosophy
-
-There are intentionally two layers:
+There are intentionally two layers of backup:
 
 **Local:**
 
@@ -193,9 +261,133 @@ Private GitHub repository
 
 The GitHub repository's normal Git history also provides historical versions of the encrypted ledger file. Because the file is encrypted, those historical versions do not contain readable ledger information.
 
-The app's **Export encrypted backup** function provides an additional standalone backup file.
+In **Settings → Local Data** you can also:
 
-## v1.0.2 changes
+- **Export encrypted backup:** downloads a standalone `.enc` file, encrypted with your current encryption password.
+- **Import encrypted backup:** reads a `.enc` file (using your current encryption password) and **merges** it into the local ledger. It doesn't replace existing data.
+- **Clear local data:** erases this device's local ledger. It does not delete the GitHub copy. Pull will bring it back.
+
+---
+
+## Security notes
+
+This application is intended to avoid storing patient identifiers, but it still contains sensitive business financial information.
+
+The important protections are:
+
+- Keep the data repository **private**.
+- Use a fine-grained token restricted to that one repository.
+- Do not commit a GitHub token to the public application repository.
+- Do not put plaintext ledger files into the data repository.
+- Use a strong encryption password.
+- Do not use patient names or other unnecessary identifying information in transaction descriptions.
+
+How secrets are handled:
+
+- The encryption password is used locally to encrypt and decrypt the ledger, and is never sent anywhere.
+- The GitHub token is sent only to GitHub's API.
+- If you tick "Remember" for the token or password, it is saved **unencrypted** in the browser's local storage on that device. Anyone with access to the browser profile could read it. Only use "Remember" on devices you control and trust.
+- The local working copy in IndexedDB is **not** encrypted. Encryption applies to the GitHub file and to exported backups.
+
+---
+
+## Troubleshooting
+
+| Symptom | Likely cause |
+| --- | --- |
+| "Complete the GitHub owner, repository, and token fields" | A required Settings field is empty. Remember that the token isn't kept unless "Remember token" is ticked. |
+| "Enter the encryption password in Settings" | Same, for the password. |
+| `GitHub 401` | The token is wrong, expired, or revoked. |
+| `GitHub 403` | The token lacks **Contents: Read and write** on the data repository, or the repository isn't in its selected list. |
+| `GitHub 404` on **Pull** | The file doesn't exist yet (push first), or the owner, repository, or file name is misspelled. A 404 on **Push** is treated as "first upload." |
+| `GitHub 409` or `422` | The file changed on GitHub during your push, or the repository has no `main` branch. Try again; check the branch name. |
+| Pull or import says it can't decrypt | The encryption password is different from the one used to create the file. |
+| Browser keeps showing an old version of the app | The service worker is serving cached files. See [Updating a deployed app](#updating-a-deployed-app). |
+| A category is missing on a second device | Categories aren't synced; re-add it in Settings. |
+
+---
+
+## For developers
+
+### Files
+
+| File | Purpose |
+| --- | --- |
+| `index.html` | Page structure: four tab views, entry dialog, toast |
+| `css/style.css` | Classic Mac OS styling. Rule order matters (later rules override earlier ones). |
+| `js/app.js` | All application logic, in numbered sections |
+| `sw.js` | Service worker: caches the app shell for offline use |
+| `manifest.webmanifest` | PWA manifest (name, icons, display mode) |
+
+There are no dependencies, no build step, and no frameworks.
+
+### Data model
+
+All records live in one IndexedDB store (`records`, keyed by `id`) and share `id`, `type`, `createdAt`, and `updatedAt`.
+
+```text
+income     { date, amount, description }
+expense    { date, amount, category, description }
+billing    { serviceDate, paymentDate, billedAmount, receivedAmount, description }
+tombstone  { id, deletedAt }   // marks a deleted record
+```
+
+Other browser storage (localStorage):
+
+- `tfp-ledger-settings`: GitHub owner, repository, path, and optionally the token and password
+- `tfp-ledger-expense-categories`: the category list
+- `tfp-last-sync`: timestamp of the last successful push
+
+### Encrypted file format
+
+`ledger.enc` is JSON:
+
+```json
+{
+  "format": "TFP-LEDGER-ENC",
+  "version": 1,
+  "kdf": "PBKDF2-SHA256",
+  "iterations": 210000,
+  "cipher": "AES-256-GCM",
+  "salt": "<base64>",
+  "iv": "<base64>",
+  "data": "<base64 ciphertext>"
+}
+```
+
+The decrypted payload is `{ "version": 1, "updatedAt": "<ISO date>", "records": [ ... ] }`.
+
+### Merge rule
+
+Records from both sides are combined by `id`. For each `id`, the record with the larger `updatedAt` (or `createdAt` if absent) is kept; ties go to the later-listed record, which is the remote one.
+
+### Known limitations
+
+- Pushes always target the `main` branch.
+- Tombstones are never purged, so they accumulate slowly.
+- `today()` is based on UTC, so in the evening in US time zones the default date can be tomorrow's.
+- Categories aren't synced between devices.
+- The local IndexedDB copy is stored unencrypted.
+
+### Updating a deployed app
+
+The service worker serves files from its cache first. If you deploy a change and browsers keep running the old version, increment the version at the top of `sw.js`:
+
+```js
+const CACHE_NAME = 'tfp-ledger-v1.0.4';
+```
+
+Also bump it whenever you add or rename a file listed in the service worker's `APP_SHELL` list. (In older copies of the file the constant is simply named `CACHE`.)
+
+---
+
+## Changelog
+
+### v1.0.3
+
+- Title bar, tabs, and sync bar stay pinned while scrolling.
+
+### v1.0.2
 
 - Register now displays Gross Charges, Expenses, and Revenue Reduction.
 - Expense category is visible in the Register.
@@ -203,3 +395,7 @@ The app's **Export encrypted backup** function provides an additional standalone
 - Statement preview uses a bank-statement-style transaction table with Gross Charges, Expenses, and Revenue Reduction columns.
 - Statement expense detail is grouped by category; categories with no expenses are omitted.
 - PDF statements use the same layout and can span multiple pages.
+
+### v1.0.0
+
+- Initial release.

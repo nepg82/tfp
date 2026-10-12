@@ -1,8 +1,59 @@
-const CACHE = 'tfp-ledger-v1.0.3';
-const ASSETS = ['./','./index.html','./manifest.webmanifest','./css/style.css','./js/app.js','./app-icons/app-icon-192.png','./app-icons/app-icon-512.png'];
-self.addEventListener('install', e => e.waitUntil(caches.open(CACHE).then(c => c.addAll(ASSETS)).then(() => self.skipWaiting())));
-self.addEventListener('activate', e => e.waitUntil(caches.keys().then(keys => Promise.all(keys.filter(k => k !== CACHE).map(k => caches.delete(k)))).then(() => self.clients.claim())));
-self.addEventListener('fetch', e => {
-  if (e.request.method !== 'GET') return;
-  e.respondWith(caches.match(e.request).then(cached => cached || fetch(e.request).then(r => { const copy=r.clone(); caches.open(CACHE).then(c=>c.put(e.request,copy)); return r; }).catch(() => caches.match('./index.html'))));
+/*
+ * TFP Ledger service worker
+ * Caches the app shell so the ledger works offline.
+ * Bump CACHE_NAME whenever any cached file changes so users get the update.
+ */
+
+const CACHE_NAME = 'tfp-ledger-v1.0.4';
+
+const APP_SHELL = [
+  './',
+  './index.html',
+  './manifest.webmanifest',
+  './css/style.css',
+  './js/app.js',
+  './app-icons/app-icon-192.png',
+  './app-icons/app-icon-512.png'
+];
+
+// Install: pre-cache the app shell, then activate immediately.
+self.addEventListener('install', event => {
+  event.waitUntil(
+    caches.open(CACHE_NAME)
+      .then(cache => cache.addAll(APP_SHELL))
+      .then(() => self.skipWaiting())
+  );
+});
+
+// Activate: delete old caches, then take control of open pages.
+self.addEventListener('activate', event => {
+  event.waitUntil(
+    caches.keys()
+      .then(keys => Promise.all(
+        keys
+          .filter(key => key !== CACHE_NAME)
+          .map(key => caches.delete(key))
+      ))
+      .then(() => self.clients.claim())
+  );
+});
+
+// Fetch: cache-first. On a miss, go to the network and cache the response.
+// If the network fails too, fall back to the cached index page.
+self.addEventListener('fetch', event => {
+  if (event.request.method !== 'GET') return;
+
+  event.respondWith(
+    caches.match(event.request).then(cached => {
+      if (cached) return cached;
+
+      return fetch(event.request)
+        .then(response => {
+          const copy = response.clone();
+          caches.open(CACHE_NAME).then(cache => cache.put(event.request, copy));
+          return response;
+        })
+        .catch(() => caches.match('./index.html'));
+    })
+  );
 });
