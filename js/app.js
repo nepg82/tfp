@@ -7,6 +7,7 @@
    Record types stored in IndexedDB (all have id, createdAt, updatedAt):
      income     { date, amount, description }
      expense    { date, amount, category, description }
+     category   { name }            <- an expense category (synced like any record)
      billing    { serviceDate, paymentDate, billedAmount, receivedAmount, description }
      tombstone  { id, deletedAt }   <- marks a deleted record so deletes sync
 
@@ -15,7 +16,7 @@
      2. Small helpers
      3. IndexedDB
      4. Settings (localStorage)
-     5. Expense categories
+     5. Expense categories (synced records)
      6. Register / billing / summary rendering
      7. Add / edit / delete entries
      8. Register filter controls
@@ -37,7 +38,14 @@ const DB_VERSION = 1;
 const STORE = 'records';
 
 const SETTINGS_KEY = 'tfp-ledger-settings';
-const CATEGORIES_KEY = 'tfp-ledger-expense-categories';
+
+// Categories used to live in localStorage. They are now ordinary records so they sync.
+// These two keys are only used to migrate an older device's list (see migrateCategories).
+const LEGACY_CATEGORIES_KEY = 'tfp-ledger-expense-categories';
+const CATEGORIES_MIGRATED_KEY = 'tfp-ledger-categories-migrated';
+
+// Record types that show up in the register, billing list, and statements
+const LEDGER_TYPES = ['income', 'expense', 'billing'];
 
 const DEFAULT_CATEGORIES = [
   'Fees', 'Advertising', 'Office Supplies', 'Software', 'Professional Services',
@@ -87,9 +95,9 @@ function toast(msg) {
   window._toast = setTimeout(() => (t.style.display = 'none'), 2500);
 }
 
-// Every record except deletion markers
+// Every real ledger entry (not deletion markers, not categories)
 function activeRecords() {
-  return records.filter(r => r.type !== 'tombstone');
+  return records.filter(r => LEDGER_TYPES.includes(r.type));
 }
 
 // The date a record "counts" on: payment date for billing, otherwise its date
@@ -186,31 +194,67 @@ function saveSettings() {
 
 
 /* ==========================================================================
-   5. Expense categories (stored in localStorage)
+   5. Expense categories
+   Each category is its own record, { id: 'category:<lowercase name>', type: 'category',
+   name }, so categories sync through GitHub like everything else. Deleting one
+   writes a tombstone with the same id. `categories` is just a sorted list of names,
+   rebuilt from `records` every time the screen refreshes.
    ========================================================================== */
 
-function loadCategories() {
-  try {
-    const saved = JSON.parse(localStorage.getItem(CATEGORIES_KEY) || 'null');
-    if (Array.isArray(saved) && saved.length) {
-      return [...new Set(saved.filter(Boolean))];
-    }
-  } catch { /* fall through to defaults */ }
+let categories = [];
 
-  localStorage.setItem(CATEGORIES_KEY, JSON.stringify(DEFAULT_CATEGORIES));
-  return [...DEFAULT_CATEGORIES];
+const categoryId = name => 'category:' + name.trim().toLowerCase();
+
+function rebuildCategories() {
+  categories = records
+    .filter(r => r.type === 'category')
+    .map(r => r.name)
+    .sort((a, b) => a.localeCompare(b));
 }
 
-let categories = loadCategories();
+async function addCategory(name) {
+  const now = Date.now();
+  await putMany([{ id: categoryId(name), type: 'category', name, createdAt: now, updatedAt: now }]);
+  records = await getAll();
+  refresh();
+  setSyncDirty();
+}
 
-// Clean up (trim, dedupe, sort), persist, and re-render everything that shows categories
-function saveCategories() {
-  categories = [...new Set(categories.map(x => x.trim()).filter(Boolean))]
-    .sort((a, b) => a.localeCompare(b));
+async function deleteCategory(name) {
+  const now = Date.now();
+  await putMany([{ id: categoryId(name), type: 'tombstone', deletedAt: now, updatedAt: now }]);
+  records = await getAll();
+  refresh();
+  setSyncDirty();
+}
 
-  localStorage.setItem(CATEGORIES_KEY, JSON.stringify(categories));
-  renderCategories();
-  populateRegisterCategory();
+// Create records for the given names, skipping any that already exist (or were deleted).
+// Timestamps are 0, so any real add or delete, here or on another device, always wins.
+async function seedCategories(names) {
+  const existingIds = new Set(records.map(r => r.id));
+  const items = [...new Set(names.map(n => String(n).trim()).filter(Boolean))]
+    .filter(n => !existingIds.has(categoryId(n)))
+    .map(n => ({ id: categoryId(n), type: 'category', name: n, createdAt: 0, updatedAt: 0 }));
+
+  if (items.length) {
+    await putMany(items);
+    records = await getAll();
+  }
+}
+
+// One-time upgrade: older versions kept categories in localStorage.
+// Convert that list (or the starter list on a brand-new device) into records.
+async function migrateCategories() {
+  if (localStorage.getItem(CATEGORIES_MIGRATED_KEY)) return;
+
+  let names = DEFAULT_CATEGORIES;
+  try {
+    const saved = JSON.parse(localStorage.getItem(LEGACY_CATEGORIES_KEY) || 'null');
+    if (Array.isArray(saved) && saved.length) names = saved;
+  } catch { /* use the starter list */ }
+
+  await seedCategories(names);
+  localStorage.setItem(CATEGORIES_MIGRATED_KEY, '1');
 }
 
 // The list with Delete buttons in Settings
@@ -381,6 +425,7 @@ function renderSummary() {
 
 // Redraw the whole UI from the current in-memory data
 function refresh() {
+  rebuildCategories();
   renderRegister();
   renderBilling();
   renderSummary();
@@ -561,14 +606,13 @@ document.addEventListener('click', async e => {
   if (categoryBtn) {
     const name = categoryBtn.dataset.categoryDelete;
     if (confirm(`Delete the category “${name}”? Existing expenses will keep their category.`)) {
-      categories = categories.filter(x => x !== name);
-      saveCategories();
+      await deleteCategory(name);
     }
   }
 });
 
 // Add-category box
-$('addCategoryBtn').onclick = () => {
+$('addCategoryBtn').onclick = async () => {
   const input = $('newCategory');
   const name = input.value.trim();
   if (!name) return;
@@ -578,8 +622,7 @@ $('addCategoryBtn').onclick = () => {
     return;
   }
 
-  categories.push(name);
-  saveCategories();
+  await addCategory(name);
   input.value = '';
   input.focus();
 };
@@ -939,6 +982,7 @@ async function push() {
 
   const merged = [...mergeRecords(records, remote).values()];
   await replaceLocalRecords(merged);
+  refresh();
 
   $('syncStatus').textContent = 'Encrypting…';
   const content = await encryptData(merged, password);
@@ -1033,6 +1077,7 @@ $('clearBtn').onclick = async () => {
   if (confirm('Clear all local ledger data? This does not delete the GitHub copy.')) {
     await clearDB();
     records = [];
+    await seedCategories(DEFAULT_CATEGORIES);   // so the Expense form still has categories
     refresh();
     setSyncDirty();
     toast('Local ledger cleared.');
@@ -1093,7 +1138,41 @@ document.querySelectorAll('.tab').forEach(tab => {
    13. PDF statement generator
    Builds a PDF by hand (no library): US Letter pages, Helvetica text only.
    Coordinates are in points; (0,0) is the bottom-left corner of the page.
+
+   Each page is built from two buffers: shapes (shading, lines) and text.
+   Shapes are written first and text last, so text always sits on top of the
+   shading, and shapes never appear inside the PDF's text block.
    ========================================================================== */
+
+// Helvetica character widths (1/1000 of the font size) for ASCII 32-126.
+// PDF has no built-in right-align or center, so we measure text ourselves.
+const HELVETICA_WIDTHS = [
+  278, 278, 355, 556, 556, 889, 667, 191, 333, 333, 389, 584, 278, 333, 278, 278,    // space ! " # $ % & ' ( ) * + , - . /
+  556, 556, 556, 556, 556, 556, 556, 556, 556, 556, 278, 278, 584, 584, 584, 556,    // 0-9 : ; < = > ?
+  1015, 667, 667, 722, 722, 667, 611, 778, 722, 278, 500, 667, 556, 833, 722, 778,   // @ A-O
+  667, 778, 722, 667, 611, 722, 667, 944, 667, 667, 611, 278, 278, 278, 469, 556,    // P-Z [ \ ] ^ _
+  333, 556, 556, 500, 556, 556, 278, 556, 556, 222, 222, 500, 222, 833, 556, 556,    // ` a-o
+  556, 556, 333, 500, 278, 556, 500, 722, 500, 500, 500, 334, 260, 334, 584          // p-z { | } ~
+];
+
+// Width of text in points. Non-ASCII characters print as "?", so they're measured as "?".
+function pdfTextWidth(text, size) {
+  const s = String(text);
+  let units = 0;
+  for (let i = 0; i < s.length; i++) {
+    const code = s.charCodeAt(i);
+    units += (code >= 32 && code <= 126) ? HELVETICA_WIDTHS[code - 32] : HELVETICA_WIDTHS['?'.charCodeAt(0) - 32];
+  }
+  return units * size / 1000;
+}
+
+// Shorten text with "..." if it is wider than maxWidth
+function pdfFit(text, size, maxWidth) {
+  let s = String(text);
+  if (pdfTextWidth(s, size) <= maxWidth) return s;
+  while (s.length && pdfTextWidth(s + '...', size) > maxWidth) s = s.slice(0, -1);
+  return s + '...';
+}
 
 // Escape text for a PDF string; non-ASCII characters become "?"
 function pdfEsc(s) {
@@ -1104,53 +1183,71 @@ function pdfEsc(s) {
     .replace(/[^\x20-\x7E]/g, '?');
 }
 
-// Draw text at (x, y)
+const pdfRound = n => Math.round(n * 100) / 100;
+
+// Draw text with its left edge at x
 function pdfText(x, y, text, size = 9, font = 'F1') {
-  return `/${font} ${size} Tf\n1 0 0 1 ${x} ${y} Tm\n(${pdfEsc(text)}) Tj\n`;
+  return `/${font} ${size} Tf\n1 0 0 1 ${pdfRound(x)} ${pdfRound(y)} Tm\n(${pdfEsc(text)}) Tj\n`;
 }
 
-// Draw a thin line
-function pdfLine(x1, y1, x2, y2) {
-  return `0.6 w\n${x1} ${y1} m\n${x2} ${y2} l\nS\n`;
+// Draw text with its right edge at rightX
+function pdfTextRight(rightX, y, text, size = 9) {
+  return pdfText(rightX - pdfTextWidth(text, size), y, text, size);
 }
 
-// Draw a filled gray rectangle (used for table header bands)
+// Draw text centered on centerX
+function pdfTextCenter(centerX, y, text, size = 9) {
+  return pdfText(centerX - pdfTextWidth(text, size) / 2, y, text, size);
+}
+
+// Draw a line (width in points; gray 0 = black, 1 = white)
+function pdfLine(x1, y1, x2, y2, width = 0.6, gray = 0) {
+  return `${gray} G\n${width} w\n${pdfRound(x1)} ${pdfRound(y1)} m\n${pdfRound(x2)} ${pdfRound(y2)} l\nS\n0 G\n`;
+}
+
+// Draw a filled gray rectangle (used for header bands and row shading)
 function pdfRect(x, y, w, h, gray = 0.9) {
-  return `${gray} g\n${x} ${y} ${w} ${h} re\nf\n0 g\n`;
+  return `${gray} g\n${pdfRound(x)} ${pdfRound(y)} ${pdfRound(w)} ${pdfRound(h)} re\nf\n0 g\n`;
 }
 
 function generatePDF(from, to) {
   const d = statementData(from, to);
 
-  // Page geometry
-  const W = 612, H = 792;          // US Letter
+  // Page geometry (points)
+  const W = 612, H = 792;            // US Letter
   const margin = 42;
-  const usable = W - margin * 2;
+  const right = W - margin;          // right edge of the content area
+  const usable = right - margin;     // width of the content area
+  const cellPad = 5;                 // space between a column line and its text
 
-  const pages = [];                // finished page content streams
-  let content = '';                // content stream of the page being built
-  let y = H - 42;                  // current vertical position (moves down the page)
+  const HEADER_GRAY = .88;           // table header bands
+  const STRIPE_GRAY = .93;           // alternating row shading
+
+  const pages = [];                  // finished pages
+  let gfx = '';                      // shapes for the current page
+  let txt = '';                      // text for the current page
+  let y = H - 42;                    // current vertical position (moves down the page)
 
   // --- Page management ---
 
   const header = () => {
-    content += pdfText(margin, y, 'TRUE FAITH PSYCHIATRY', 17);
-    content += pdfText(W - margin - 130, y, 'ACCOUNT STATEMENT', 9);
+    txt += pdfText(margin, y, 'TRUE FAITH PSYCHIATRY', 17);
+    txt += pdfText(W - margin - 130, y, 'ACCOUNT STATEMENT', 9);
     y -= 23;
-    content += pdfText(margin, y, `${dateFmt(from)} - ${dateFmt(to)}`, 10);
-    content += pdfLine(margin, y - 8, W - margin, y - 8);
+    txt += pdfText(margin, y, `${dateFmt(from)} - ${dateFmt(to)}`, 10);
+    gfx += pdfLine(margin, y - 8, W - margin, y - 8);
     y -= 25;
   };
 
   const beginPage = () => {
-    content = 'BT\n';
+    gfx = '';
+    txt = '';
     y = H - 42;
     header();
   };
 
   const finishPage = () => {
-    content += 'ET';
-    pages.push(content);
+    pages.push(`${gfx}BT\n${txt}ET`);
   };
 
   // Start a new page if fewer than `need` points remain
@@ -1161,88 +1258,167 @@ function generatePDF(from, to) {
     }
   };
 
-  // --- Transactions table ---
-
-  const col = [margin, 128, 330, 410, 500];   // x position of each column
-
-  const transactionHeader = () => {
-    ensure(38);
-    content += pdfRect(margin, y - 18, usable, 18, .88);
-    content += pdfText(col[0], y - 13, 'Date', 8);
-    content += pdfText(col[1], y - 13, 'Description', 8);
-    content += pdfText(col[2], y - 13, 'Gross Charges', 8);
-    content += pdfText(col[3], y - 13, 'Expenses', 8);
-    content += pdfText(col[4], y - 13, 'Revenue Reduction', 8);
-    y -= 26;
+  // Horizontal divider between sections (skipped at the very top of a page,
+  // where it would just double up with the page header's line)
+  const separator = () => {
+    if (y < H - 42 - 48) gfx += pdfLine(margin, y, W - margin, y);
   };
 
-  beginPage();
-  content += pdfText(margin, y, 'TRANSACTIONS', 11);
-  y -= 10;
-  transactionHeader();
+  // --- Table helpers ---
+  // A table is described by `edges`: the x position of each column boundary,
+  // including the left and right sides. Columns are separated by thin vertical lines.
 
-  for (const r of statementRecordsSorted(d)) {
-    ensure(20);
-    const row = statementRow(r);
+  // Thin vertical lines between columns, for one band of the table
+  const columnRules = (edges, bottom, height) => {
+    for (let i = 1; i < edges.length - 1; i++) {
+      gfx += pdfLine(edges[i], bottom, edges[i], bottom + height, .5, .55);
+    }
+  };
 
-    content += pdfText(col[0], y, dateFmt(row.date), 7);
-    content += pdfText(col[1], y, row.desc.slice(0, 31), 7);
-    if (row.gross) content += pdfText(col[2] + 48, y, money(row.gross), 7);
-    if (row.exp)   content += pdfText(col[3] + 55, y, money(row.exp), 7);
-    if (row.red)   content += pdfText(col[4] + 65, y, money(row.red), 7);
+  // Put text in column `col`, aligned 'left', 'center', or 'right', trimmed to fit
+  const cell = (edges, col, text, align, size, baseline) => {
+    if (text === '') return;
+    const left = edges[col];
+    const rightEdge = edges[col + 1];
+    const fitted = pdfFit(text, size, rightEdge - left - cellPad * 2);
+
+    if (align === 'right') txt += pdfTextRight(rightEdge - cellPad, baseline, fitted, size);
+    else if (align === 'center') txt += pdfTextCenter((left + rightEdge) / 2, baseline, fitted, size);
+    else txt += pdfText(left + cellPad, baseline, fitted, size);
+  };
+
+  // Gray header band (18pt tall) with titles: labels = [[text, align], ...]
+  const tableHeader = (edges, labels) => {
+    gfx += pdfRect(margin, y - 18, usable, 18, HEADER_GRAY);
+    columnRules(edges, y - 18, 18);
+    labels.forEach(([label, align], i) => cell(edges, i, label, align, 8, y - 13));
+    y -= 29;   // first row's band starts exactly at the bottom of the header
+  };
+
+  // One data row (15pt tall). Every second row is shaded.
+  // cells = [[text, align], ...]
+  const tableRow = (edges, index, cells) => {
+    if (index % 2 === 1) gfx += pdfRect(margin, y - 4, usable, 15, STRIPE_GRAY);
+    columnRules(edges, y - 4, 15);
+    cells.forEach(([text, align], i) => cell(edges, i, text, align, 7, y));
     y -= 15;
-  }
+  };
+
+  // --- Transactions table ---
+
+  const tEdges = [margin, 112, 298, 384, 470, right];
+  const tLabels = [
+    ['Date', 'left'],
+    ['Description', 'left'],
+    ['Gross Charges', 'center'],
+    ['Expenses', 'center'],
+    ['Revenue Reduction', 'center']
+  ];
+
+  beginPage();
+  txt += pdfText(margin, y, 'TRANSACTIONS', 11);
+  y -= 10;
+  tableHeader(tEdges, tLabels);
+
+  statementRecordsSorted(d).forEach((r, i) => {
+    // On a new page, repeat the column titles
+    if (y - 20 < 42) {
+      finishPage();
+      beginPage();
+      tableHeader(tEdges, tLabels);
+    }
+
+    const row = statementRow(r);
+    tableRow(tEdges, i, [
+      [dateFmt(row.date), 'left'],
+      [row.desc, 'left'],
+      [row.gross ? money(row.gross) : '', 'right'],
+      [row.exp ? money(row.exp) : '', 'right'],
+      [row.red ? money(row.red) : '', 'right']
+    ]);
+  });
 
   // --- Revenue summary ---
 
+  // A label on the left, an amount right-aligned at the margin
+  const summaryLine = (label, value, valueSize = 9) => {
+    txt += pdfText(margin, y, label, 9);
+    txt += pdfTextRight(right, y, money(value), valueSize);
+  };
+
   y -= 5;
   ensure(60);
-  content += pdfLine(margin, y, W - margin, y);
+  separator();
   y -= 18;
 
-  content += pdfText(margin, y, 'REVENUE SUMMARY', 11);
+  txt += pdfText(margin, y, 'REVENUE SUMMARY', 11);
   y -= 17;
-  content += pdfText(margin, y, 'Gross Charges', 9);
-  content += pdfText(460, y, money(d.gross), 9);
+  summaryLine('Gross Charges', d.gross);
   y -= 14;
-  content += pdfText(margin, y, 'Revenue Reduction', 9);
-  content += pdfText(460, y, money(d.reduction), 9);
+  summaryLine('Revenue Reduction', d.reduction);
   y -= 14;
-  content += pdfText(margin, y, 'Net Revenue', 9);
-  content += pdfText(460, y, money(d.gross - d.reduction), 9);
+  summaryLine('Net Revenue', d.gross - d.reduction);
   y -= 23;
 
   // --- Expenses by category ---
 
-  content += pdfText(margin, y, 'EXPENSES BY CATEGORY', 11);
+  const eEdges = [margin, 112, 470, right];
+  const eLabels = [
+    ['Date', 'left'],
+    ['Description', 'left'],
+    ['Amount', 'center']
+  ];
+
+  // Category name band, then the column titles
+  const categoryHeader = category => {
+    gfx += pdfRect(margin, y - 14, usable, 14, HEADER_GRAY);
+    txt += pdfText(margin + 4, y - 10, category.toUpperCase(), 8);
+    y -= 14;
+    tableHeader(eEdges, eLabels);
+  };
+
+  // Start a new page (repeating the category header) if fewer than `need` points remain
+  const ensureInCategory = (category, need) => {
+    if (y - need < 42) {
+      finishPage();
+      beginPage();
+      categoryHeader(category);
+    }
+  };
+
+  txt += pdfText(margin, y, 'EXPENSES BY CATEGORY', 11);
   y -= 17;
 
   for (const [category, items] of expenseGroups(d.expenses)) {
-    ensure(50);
-    content += pdfRect(margin, y - 14, usable, 14, .88);
-    content += pdfText(margin + 4, y - 10, category.toUpperCase(), 8);
-    y -= 24;
+    ensure(70);
+    categoryHeader(category);
 
-    for (const r of items.sort((a, b) => a.date.localeCompare(b.date))) {
-      ensure(18);
-      content += pdfText(margin + 4, y, dateFmt(r.date), 7);
-      content += pdfText(128, y, (r.description || category).slice(0, 42), 7);
-      content += pdfText(500, y, money(r.amount), 7);
-      y -= 13;
-    }
+    items
+      .sort((a, b) => a.date.localeCompare(b.date))
+      .forEach((r, i) => {
+        ensureInCategory(category, 18);
+        tableRow(eEdges, i, [
+          [dateFmt(r.date), 'left'],
+          [r.description || category, 'left'],
+          [money(r.amount), 'right']
+        ]);
+      });
 
-    content += pdfLine(margin + 4, y + 4, W - margin, y + 4);
-    content += pdfText(350, y - 8, 'Category Total', 8);
-    content += pdfText(500, y - 8, money(items.reduce((sum, r) => sum + Number(r.amount), 0)), 8);
-    y -= 24;
+    // Category total row (not shaded), with a heavier line above it
+    ensureInCategory(category, 18);
+    gfx += pdfLine(margin, y + 11, right, y + 11, .8);
+    columnRules(eEdges, y - 4, 15);
+    cell(eEdges, 1, 'Category Total', 'left', 8, y);
+    cell(eEdges, 2, money(items.reduce((sum, r) => sum + Number(r.amount), 0)), 'right', 8, y);
+    y -= 29;
   }
 
   // --- Final statement summary ---
 
   ensure(105);
-  content += pdfLine(margin, y, W - margin, y);
+  separator();
   y -= 20;
-  content += pdfText(margin, y, 'STATEMENT SUMMARY', 11);
+  txt += pdfText(margin, y, 'STATEMENT SUMMARY', 11);
   y -= 18;
 
   const summary = [
@@ -1255,11 +1431,10 @@ function generatePDF(from, to) {
 
   for (const [label, value] of summary) {
     if (label === 'NET INCOME') {
-      content += pdfLine(margin, y + 5, W - margin, y + 5);
+      gfx += pdfLine(margin, y + 5, W - margin, y + 5);
       y -= 8;
     }
-    content += pdfText(margin, y, label, 9);
-    content += pdfText(460, y, money(value), label === 'NET INCOME' ? 11 : 9);
+    summaryLine(label, value, label === 'NET INCOME' ? 11 : 9);
     y -= 16;
   }
 
@@ -1314,9 +1489,7 @@ function generatePDF(from, to) {
   await openDB();
   loadSettings();
   records = await getAll();
-
-  renderCategories();
-  populateRegisterCategory();
+  await migrateCategories();
 
   // Default statement range: first of this month through today
   const now = new Date();

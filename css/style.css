@@ -206,14 +206,26 @@ table {
 th,
 td {
   border-bottom: 1px solid #aaa;
+  border-right: 1px solid #aaa;      /* thin vertical line between columns */
   padding: 6px 7px;
   text-align: left;
   white-space: nowrap;
 }
 
+th:last-child,
+td:last-child {
+  border-right: 0;
+}
+
 th {
   background: #ddd;
   border-bottom: 2px solid #111;
+  border-right-color: #888;
+}
+
+/* Titles of numeric columns are centered over their (right-aligned) values */
+th.num {
+  text-align: center;
 }
 
 td.num {
@@ -647,6 +659,15 @@ button:active {
 .statement-preview .empty {
   padding: 8px;
   font-style: italic;
+}
+
+/* Alternating row shading in the statement's tables (not the summary box) */
+.statement-preview .statement-section tbody tr:nth-child(even) {
+  background: #ececec;
+}
+
+.statement-preview .statement-section tbody tr.statement-total {
+  background: #fff;
 }
 
 .nowrap {

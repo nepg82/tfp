@@ -190,8 +190,9 @@ The Register can be filtered by type (Income / Expenses / Billing) and by catego
 Manage categories in **Settings → Expense Categories**. They appear in the Expense form and the Register's category filter.
 
 - A starter list is provided (Fees, Advertising, Office Supplies, Software, Professional Services, Rent, Utilities, Insurance, Travel, Other).
-- Deleting a category does not change existing expenses; they keep their category text.
-- **The category list is stored per device and is not part of the GitHub sync.** Records synchronize with their category names, but on a new device you'll see the starter list until you add your own categories there. Expenses with a category that isn't in the list still display and still appear on statements, but you must add the category to filter by it.
+- Deleting a category does not change existing expenses; they keep their category text and still appear on statements. Re-add the category if you want to filter by it again.
+- Categories can't be renamed. To rename one, add the new name and delete the old one (existing expenses keep the old name).
+- **Categories sync with the rest of the ledger.** Adding or deleting one marks the ledger as having unsynced changes, and Push and Pull carry categories between devices. If two devices add different categories, you end up with both. A category deleted on one device is deleted everywhere after the next sync, unless someone adds it back later.
 
 ### The sync status bar
 
@@ -208,6 +209,7 @@ Each device has its own local copy of the ledger (in the browser's IndexedDB).
 - New records have unique IDs, so additions made on different devices can be merged.
 - If the same record was edited on two devices, the **most recently edited version wins**. If the timestamps are identical, the GitHub version wins.
 - Deleted records are represented as tombstones so a deletion can synchronize to another device.
+- Expense categories are stored as records too, so they sync the same way.
 
 For normal use, a good habit is:
 
@@ -218,6 +220,8 @@ For normal use, a good habit is:
 Avoid pushing from two devices at the same moment. If GitHub rejects a push because the file changed in the meantime, simply try again.
 
 The app keeps working from the local copy when GitHub is unavailable.
+
+**Upgrading to v1.0.4 or later:** categories now travel inside the ledger file. Update the app on *every* device (reload it so the new service worker takes over) before pushing from the new version. An older copy that pulls category records doesn't know what they are and will show them as blank Income lines. The first time each device starts the new version, its existing category list is converted into ledger records. If your devices had different lists, they're combined.
 
 ---
 
@@ -233,12 +237,14 @@ A statement contains:
 - **Expense detail:** expenses grouped by category, with a total for each. Categories with no expenses in the range are omitted.
 - **Summary:** Gross Charges, Revenue Reduction, Net Revenue, Total Expenses, and Net Income
 
-The PDF is generated locally in the browser and uses the same layout as the preview, spanning multiple pages if needed.
+The PDF is generated locally in the browser and uses the same layout as the preview, spanning multiple pages if needed. Column titles repeat at the top of each page.
+
+In both the preview and the PDF, column titles are centered over their columns, amounts are right-aligned, thin vertical lines separate the columns, and every second row is shaded to make long lists easier to follow.
 
 PDF limitations:
 
 - The PDF uses a basic built-in font, so characters outside plain English letters, numbers, and punctuation (accented letters, curly quotes, emoji) print as `?`.
-- Long descriptions are shortened (about 31 characters in the transactions list and 42 in the expense detail). The on-screen preview shows full text.
+- A description too long for its column is cut off with "...". The on-screen preview shows the full text.
 
 ---
 
@@ -265,7 +271,7 @@ In **Settings → Local Data** you can also:
 
 - **Export encrypted backup:** downloads a standalone `.enc` file, encrypted with your current encryption password.
 - **Import encrypted backup:** reads a `.enc` file (using your current encryption password) and **merges** it into the local ledger. It doesn't replace existing data.
-- **Clear local data:** erases this device's local ledger. It does not delete the GitHub copy. Pull will bring it back.
+- **Clear local data:** erases this device's local ledger. It does not delete the GitHub copy. Pull will bring it back. Expense categories reset to the starter list until you Pull.
 
 ---
 
@@ -303,7 +309,7 @@ How secrets are handled:
 | `GitHub 409` or `422` | The file changed on GitHub during your push, or the repository has no `main` branch. Try again; check the branch name. |
 | Pull or import says it can't decrypt | The encryption password is different from the one used to create the file. |
 | Browser keeps showing an old version of the app | The service worker is serving cached files. See [Updating a deployed app](#updating-a-deployed-app). |
-| A category is missing on a second device | Categories aren't synced; re-add it in Settings. |
+| Blank "Income" lines appear after a pull | Another device is still running a version older than v1.0.4. Update it (see [Using multiple devices](#using-multiple-devices)). |
 
 ---
 
@@ -328,6 +334,7 @@ All records live in one IndexedDB store (`records`, keyed by `id`) and share `id
 ```text
 income     { date, amount, description }
 expense    { date, amount, category, description }
+category   { name }            // id is "category:" + lowercase name
 billing    { serviceDate, paymentDate, billedAmount, receivedAmount, description }
 tombstone  { id, deletedAt }   // marks a deleted record
 ```
@@ -335,7 +342,7 @@ tombstone  { id, deletedAt }   // marks a deleted record
 Other browser storage (localStorage):
 
 - `tfp-ledger-settings`: GitHub owner, repository, path, and optionally the token and password
-- `tfp-ledger-expense-categories`: the category list
+- `tfp-ledger-categories-migrated`: set once this device's old category list has been converted into records. (The old `tfp-ledger-expense-categories` key is read only for that one-time conversion.)
 - `tfp-last-sync`: timestamp of the last successful push
 
 ### Encrypted file format
@@ -361,12 +368,14 @@ The decrypted payload is `{ "version": 1, "updatedAt": "<ISO date>", "records": 
 
 Records from both sides are combined by `id`. For each `id`, the record with the larger `updatedAt` (or `createdAt` if absent) is kept; ties go to the later-listed record, which is the remote one.
 
+Categories are one record each, so they merge per category. Deleting a category writes a tombstone with the same id, and adding it again later replaces the tombstone. Starter and migrated categories are created with a timestamp of 0, so any real add or delete on any device overrides them.
+
 ### Known limitations
 
 - Pushes always target the `main` branch.
 - Tombstones are never purged, so they accumulate slowly.
 - `today()` is based on UTC, so in the evening in US time zones the default date can be tomorrow's.
-- Categories aren't synced between devices.
+- Category names are matched case-insensitively, and there's no rename (delete and re-add).
 - The local IndexedDB copy is stored unencrypted.
 
 ### Updating a deployed app
@@ -374,7 +383,7 @@ Records from both sides are combined by `id`. For each `id`, the record with the
 The service worker serves files from its cache first. If you deploy a change and browsers keep running the old version, increment the version at the top of `sw.js`:
 
 ```js
-const CACHE_NAME = 'tfp-ledger-v1.0.4';
+const CACHE_NAME = 'tfp-ledger-v1.0.5';
 ```
 
 Also bump it whenever you add or rename a file listed in the service worker's `APP_SHELL` list. (In older copies of the file the constant is simply named `CACHE`.)
@@ -382,6 +391,14 @@ Also bump it whenever you add or rename a file listed in the service worker's `A
 ---
 
 ## Changelog
+
+### v1.0.4
+
+- Expense categories now sync between devices through the encrypted ledger. Existing category lists are converted automatically on first launch.
+- Numeric column titles are centered over their columns, and thin vertical lines separate columns in the app's tables, the statement preview, and the PDF.
+- Statement rows are shaded alternately in the preview and the PDF.
+- PDF amounts are now truly right-aligned, overlong text is trimmed to fit its column, and column titles repeat on each page.
+- Push now refreshes the screen after merging in records from GitHub.
 
 ### v1.0.3
 
