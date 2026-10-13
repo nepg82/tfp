@@ -225,6 +225,8 @@ Notes:
 
 The bar under the tabs shows the current state: *Local only*, *Unsynced local changes*, *Synced*, *Pulled + merged*, or *Sync error*, along with when this device last synced. Along with the title bar and tabs, it stays visible while you scroll.
 
+If GitHub sync is set up, the app also **looks for newer data** (see [Update notice](#update-notice)).
+
 ---
 
 ## Using multiple devices
@@ -243,6 +245,15 @@ For normal use, a good habit is:
 1. **Pull** when starting work on a second device.
 2. Enter transactions.
 3. **Push** when finished.
+
+### Update notice
+
+The app never syncs by itself, but it does check whether another device has pushed newer data. It looks (read-only) when you open the app, when you switch back to it, when the internet connection returns, and every 5 minutes while it's open. If GitHub has a newer version than this device last synced with, a **black bar appears across the bottom of the screen**: "Newer data is available on GitHub," with **Pull now** and **Later** buttons. The Pull button in the sync bar also turns black.
+
+- **Pull now** merges the newer data into this device and dismisses the bar.
+- **Later** hides the bar until GitHub changes again or you next open the app.
+- Checking needs your GitHub token, but not your encryption password. If "Remember token" is off, enter the token in Settings after opening the app; until then, the sync bar says it can't check.
+- If you also have unsynced changes on this device, Pull is still safe: it merges both sets.
 
 Avoid pushing from two devices at the same moment. If GitHub rejects a push because the file changed in the meantime, simply try again.
 
@@ -348,6 +359,7 @@ How secrets are handled:
 | Pull or import says it can't decrypt | The encryption password is different from the one used to create the file. |
 | Browser keeps showing an old version of the app | The service worker is serving cached files. See [Updating a deployed app](#updating-a-deployed-app). |
 | An entry I just saved isn't in the Register | It's outside the selected period (the Register opens on This Month), or it's a pending claim (those are on the Billing tab). |
+| No "newer data" bar appears when I expect one | The check needs the GitHub owner, repository, and token to be filled in on that device (the sync bar says when the token is missing), and a working internet connection. Click **Pull** to check manually. |
 | Income categories show up in the expense list, or odd blank lines appear after a pull | Another device is still running a version older than v1.0.5. Update it (see [Using multiple devices](#using-multiple-devices)). |
 
 ---
@@ -390,6 +402,7 @@ Other browser storage (localStorage):
 
 - `tfp-ledger-settings`: GitHub owner, repository, path, and optionally the token and password
 - `tfp-last-sync`: timestamp of the last successful push or pull
+- `tfp-remote-sha`: the version of the GitHub file this device last synced with (used by the update notice)
 - `tfp-ledger-categories-migrated`, `tfp-ledger-income-categories-seeded`: flags marking one-time migrations (the old `tfp-ledger-expense-categories` key is read only once, for the first of them)
 
 ### Encrypted file format
@@ -435,7 +448,7 @@ Categories are one record each, so they merge per category. Deleting a category 
 The service worker serves files from its cache first. If you deploy a change and browsers keep running the old version, increment the version at the top of `sw.js`:
 
 ```js
-const CACHE_NAME = 'tfp-ledger-v1.0.7';
+const CACHE_NAME = 'tfp-ledger-v1.0.8';
 ```
 
 Also bump it whenever you add or rename a file listed in the service worker's `APP_SHELL` list. (In older copies of the file the constant is simply named `CACHE`.)
@@ -443,6 +456,10 @@ Also bump it whenever you add or rename a file listed in the service worker's `A
 ---
 
 ## Changelog
+
+### v1.0.7
+
+- **Update notice:** the app now checks (read-only) whether GitHub has newer data than this device, and shows a black bar along the bottom of the screen with **Pull now** and **Later** buttons. It checks at startup, when you return to the app, when you come back online, and every 5 minutes.
 
 ### v1.0.6
 

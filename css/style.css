@@ -810,3 +810,48 @@ tfoot td {
 .statement-preview .pl-sub td:last-child {
   background: #ddd;
 }
+
+/* "Newer data is available" banner: a black bar across the bottom of the screen */
+.update-banner {
+  position: fixed;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  z-index: 30;
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 12px;
+  flex-wrap: wrap;
+  padding: 10px 14px calc(10px + env(safe-area-inset-bottom, 0px));
+  background: #111;
+  color: #fff;
+  border-top: 3px solid #fff;
+  box-shadow: 0 -3px 0 #111;
+  font-size: 13px;
+}
+
+.update-actions {
+  display: flex;
+  gap: 8px;
+}
+
+/* Keep page content and pop-up messages clear of the banner */
+body.has-banner {
+  padding-bottom: 72px;
+}
+
+body.has-banner #toast {
+  bottom: 84px;
+}
+
+#toast {
+  z-index: 40;
+}
+
+/* The Pull button turns black while updates are waiting */
+.small-btn.attn {
+  background: #111;
+  color: #fff;
+  font-weight: bold;
+}

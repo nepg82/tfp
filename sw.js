@@ -4,7 +4,7 @@
  * Bump CACHE_NAME whenever any cached file changes so users get the update.
  */
 
-const CACHE_NAME = 'tfp-ledger-v1.0.6';
+const CACHE_NAME = 'tfp-ledger-v1.0.7';
 
 const APP_SHELL = [
   './',

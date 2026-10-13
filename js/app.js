@@ -46,6 +46,7 @@ const STORE = 'records';
 
 const SETTINGS_KEY = 'tfp-ledger-settings';
 const LAST_SYNC_KEY = 'tfp-last-sync';
+const REMOTE_SHA_KEY = 'tfp-remote-sha';   // version of the GitHub file this device last synced with
 
 // Categories used to live in localStorage. They are now ordinary records so they sync.
 // These keys are only used for one-time migrations (see migrateCategories).
@@ -1388,9 +1389,14 @@ function showLastSync() {
   $('lastSync').textContent = stamp ? `Last synced ${new Date(stamp).toLocaleString()}` : '';
 }
 
-function markSynced() {
+// Record a successful sync. `remoteSha` identifies the version of the GitHub file we
+// are now in step with, so the update check can tell when someone else changes it.
+function markSynced(remoteSha) {
   localStorage.setItem(LAST_SYNC_KEY, new Date().toISOString());
+  if (remoteSha) localStorage.setItem(REMOTE_SHA_KEY, remoteSha);
   showLastSync();
+  hideUpdateBanner();
+  setUpdateNote('');
 }
 
 // Upload: fetch the remote copy, merge it with local, save locally, then encrypt and upload
@@ -1427,8 +1433,9 @@ async function push(retry = true) {
   };
   if (existing?.sha) body.sha = existing.sha;
 
+  let saved;
   try {
-    await gh('PUT', url, body);
+    saved = await gh('PUT', url, body);
   } catch (e) {
     // 409 = the file changed on GitHub after we read it. Start over once (fresh read and merge).
     if (retry && String(e.message).includes('GitHub 409')) return push(false);
@@ -1436,7 +1443,7 @@ async function push(retry = true) {
   }
 
   $('syncStatus').textContent = 'Synced';
-  markSynced();
+  markSynced(saved?.content?.sha);
   toast('Ledger pushed to GitHub.');
 }
 
@@ -1456,13 +1463,94 @@ async function pull() {
   refresh();
 
   $('syncStatus').textContent = 'Pulled + merged';
-  markSynced();
+  markSynced(file.sha);
   toast(`Pulled ${remote.length} records and merged locally.`);
 }
 
 function setSyncDirty() {
   $('syncStatus').textContent = 'Unsynced local changes';
 }
+
+/* --- Update notice: tell the user when GitHub has newer data than this device ---
+   The app never syncs by itself. It only LOOKS at GitHub (read-only) and, if the file
+   there is not the version this device last synced with, shows a banner that can't be
+   missed. Looking needs the GitHub token but not the encryption password. */
+
+let latestRemoteSha = null;   // version of the GitHub file at the last check
+let dismissedSha = null;      // version the user chose "Later" for (this session only)
+let lastCheck = 0;
+let checking = false;
+
+function setUpdateNote(text) {
+  $('updateNote').textContent = text;
+}
+
+function showUpdateBanner() {
+  $('updateBanner').hidden = false;
+  document.body.classList.add('has-banner');
+  $('pullBtn').classList.add('attn');
+}
+
+function hideUpdateBanner() {
+  $('updateBanner').hidden = true;
+  document.body.classList.remove('has-banner');
+  $('pullBtn').classList.remove('attn');
+}
+
+// Compare the GitHub file's version with the one this device last synced with.
+// Quiet when sync isn't set up; `force` skips the 30-second throttle.
+async function checkForUpdates(force = false) {
+  if (checking || (!force && Date.now() - lastCheck < 30000)) return;
+
+  const owner = $('ghOwner').value.trim();
+  const repo = $('ghRepo').value.trim();
+  if (!owner || !repo) return;                         // GitHub sync isn't set up
+
+  if (!$('ghToken').value.trim()) {
+    setUpdateNote('Enter your GitHub token in Settings to check for updates.');
+    return;
+  }
+
+  checking = true;
+  lastCheck = Date.now();
+  try {
+    const file = await gh('GET', githubFileUrl(githubSettings()));
+    setUpdateNote('');
+    latestRemoteSha = file.sha;
+
+    if (file.sha === localStorage.getItem(REMOTE_SHA_KEY)) hideUpdateBanner();
+    else if (file.sha !== dismissedSha) showUpdateBanner();
+  } catch (e) {
+    const msg = String(e.message);
+    if (msg.includes('GitHub 404')) {
+      hideUpdateBanner();                              // nothing has been pushed yet
+      setUpdateNote('');
+    } else if (msg.includes('GitHub 401') || msg.includes('GitHub 403')) {
+      setUpdateNote('Update check failed: GitHub rejected the token.');
+    }
+    // Other errors (usually being offline) are ignored; we'll look again later
+  } finally {
+    checking = false;
+  }
+}
+
+// Look when the app opens, when you come back to it, when the connection returns,
+// and every 5 minutes while it's open.
+function startUpdateChecks() {
+  checkForUpdates(true);
+  document.addEventListener('visibilitychange', () => {
+    if (document.visibilityState === 'visible') checkForUpdates();
+  });
+  window.addEventListener('online', () => checkForUpdates(true));
+  setInterval(() => {
+    if (document.visibilityState === 'visible') checkForUpdates(true);
+  }, 5 * 60 * 1000);
+}
+
+$('updateLaterBtn').onclick = () => {
+  dismissedSha = latestRemoteSha;
+  hideUpdateBanner();
+};
 
 
 /* ==========================================================================
@@ -1535,18 +1623,25 @@ $('pushBtn').onclick = async () => {
   }
 };
 
-$('pullBtn').onclick = async () => {
+async function runPull() {
   try {
     await pull();
   } catch (e) {
     $('syncStatus').textContent = 'Sync error';
     alert(e.message);
   }
-};
+}
+
+$('pullBtn').onclick = runPull;
+$('updatePullBtn').onclick = runPull;
 
 // Save settings whenever any settings field changes
 ['ghOwner', 'ghRepo', 'ghPath', 'ghToken', 'encPassword', 'rememberToken', 'rememberPassword']
   .forEach(id => $(id).addEventListener('change', saveSettings));
+
+// Check for updates as soon as the GitHub details are filled in
+['ghOwner', 'ghRepo', 'ghToken']
+  .forEach(id => $(id).addEventListener('change', () => checkForUpdates(true)));
 
 // "Add" buttons. Claims added from the Billing tab start as pending;
 // the Register's button records a payment that has already arrived.
@@ -1988,6 +2083,7 @@ function generatePDF(from, to) {
 
   showLastSync();
   refresh();
+  startUpdateChecks();
 
   // Register the service worker for offline use
   if ('serviceWorker' in navigator) {

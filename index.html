@@ -35,6 +35,7 @@
         <span class="sync-info">
           <span id="syncStatus">Local only</span>
           <span id="lastSync" class="muted"></span>
+          <span id="updateNote" class="muted"></span>
         </span>
         <span class="sync-actions">
           <button id="pullBtn" class="small-btn">Pull</button>
@@ -323,6 +324,15 @@
       </div>
     </form>
   </dialog>
+
+  <!-- Shown when GitHub has newer data than this device (see checkForUpdates in app.js) -->
+  <div id="updateBanner" class="update-banner" role="alert" hidden>
+    <span><b>Newer data is available on GitHub.</b> Pull to bring this device up to date.</span>
+    <span class="update-actions">
+      <button id="updatePullBtn" class="primary-btn">Pull now</button>
+      <button id="updateLaterBtn">Later</button>
+    </span>
+  </div>
 
   <!-- Pop-up message -->
   <div id="toast" role="status" aria-live="polite"></div>
