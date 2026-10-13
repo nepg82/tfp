@@ -226,11 +226,9 @@ function saveSettings() {
   if (s.rememberToken) s.token = $('ghToken').value;
   if (s.rememberPassword) s.password = $('encPassword').value;
 
+  // Only what's ticked "remember" is stored. The boxes on screen keep their values
+  // for this session either way, so Push and Pull can still use them.
   localStorage.setItem(SETTINGS_KEY, JSON.stringify(s));
-
-  // If "remember" is off, clear the sensitive field after saving
-  if (!s.rememberToken) $('ghToken').value = '';
-  if (!s.rememberPassword) $('encPassword').value = '';
 }
 
 
@@ -1341,10 +1339,13 @@ async function gh(method, url, body) {
   };
   if (body) headers['Content-Type'] = 'application/json';
 
+  // cache: 'no-store' matters. GitHub lets browsers cache file lookups for about a
+  // minute, and a stale copy has an out-of-date "sha", which makes the upload fail with a 409.
   const res = await fetch(url, {
     method,
     headers,
-    body: body ? JSON.stringify(body) : undefined
+    body: body ? JSON.stringify(body) : undefined,
+    cache: 'no-store'
   });
 
   if (!res.ok) throw Error(`GitHub ${res.status}: ${await res.text()}`);
@@ -1393,7 +1394,7 @@ function markSynced() {
 }
 
 // Upload: fetch the remote copy, merge it with local, save locally, then encrypt and upload
-async function push() {
+async function push(retry = true) {
   saveSettings();
   const s = githubSettings();
   const password = $('encPassword').value;
@@ -1426,7 +1427,13 @@ async function push() {
   };
   if (existing?.sha) body.sha = existing.sha;
 
-  await gh('PUT', url, body);
+  try {
+    await gh('PUT', url, body);
+  } catch (e) {
+    // 409 = the file changed on GitHub after we read it. Start over once (fresh read and merge).
+    if (retry && String(e.message).includes('GitHub 409')) return push(false);
+    throw e;
+  }
 
   $('syncStatus').textContent = 'Synced';
   markSynced();

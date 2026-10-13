@@ -160,7 +160,7 @@ The same encryption password must be entered on every device that needs to read 
 
 If the encryption password is lost, the encrypted GitHub backup cannot be decrypted. There is no recovery option.
 
-The app offers optional "Remember" checkboxes for the GitHub token and encryption password. Leaving them unchecked is more secure, but means they must be entered again each time on that device. See [Security notes](#security-notes) for how remembered values are stored.
+The app offers optional "Remember" checkboxes for the GitHub token and encryption password. Leaving them unchecked is more secure: they're kept only while the page is open, and must be entered again the next time you open the app on that device. See [Security notes](#security-notes) for how remembered values are stored.
 
 ### 5. Install the app (optional)
 
@@ -343,7 +343,8 @@ How secrets are handled:
 | `GitHub 401` | The token is wrong, expired, or revoked. |
 | `GitHub 403` | The token lacks **Contents: Read and write** on the data repository, or the repository isn't in its selected list. |
 | `GitHub 404` on **Pull** | The file doesn't exist yet (push first), or the owner, repository, or file name is misspelled. A 404 on **Push** is treated as "first upload." |
-| `GitHub 409` or `422` | The file changed on GitHub during your push, or the repository has no `main` branch. Try again; check the branch name. |
+| `GitHub 409` | The file changed on GitHub after the app read it (for example another device pushed in between). Since v1.0.6 the app retries once automatically; if you still see it, Pull and then Push again. |
+| `GitHub 422` | Usually the repository has no `main` branch. Check the branch name. |
 | Pull or import says it can't decrypt | The encryption password is different from the one used to create the file. |
 | Browser keeps showing an old version of the app | The service worker is serving cached files. See [Updating a deployed app](#updating-a-deployed-app). |
 | An entry I just saved isn't in the Register | It's outside the selected period (the Register opens on This Month), or it's a pending claim (those are on the Billing tab). |
@@ -434,7 +435,7 @@ Categories are one record each, so they merge per category. Deleting a category 
 The service worker serves files from its cache first. If you deploy a change and browsers keep running the old version, increment the version at the top of `sw.js`:
 
 ```js
-const CACHE_NAME = 'tfp-ledger-v1.0.6';
+const CACHE_NAME = 'tfp-ledger-v1.0.7';
 ```
 
 Also bump it whenever you add or rename a file listed in the service worker's `APP_SHELL` list. (In older copies of the file the constant is simply named `CACHE`.)
@@ -442,6 +443,11 @@ Also bump it whenever you add or rename a file listed in the service worker's `A
 ---
 
 ## Changelog
+
+### v1.0.6
+
+- Fixed `GitHub 409` errors on Push: the app could reuse a cached copy of the GitHub file for up to a minute, which gave it an out-of-date version marker. GitHub requests now bypass the cache, and a Push that still hits a conflict retries once automatically.
+- If "Remember token" or "Remember password" is unticked, the value you typed now stays in the box for the current session (it just isn't saved). Previously it was erased the moment you left the field, so Push and Pull couldn't use it.
 
 ### v1.0.5
 
