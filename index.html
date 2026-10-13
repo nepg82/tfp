@@ -32,7 +32,10 @@
 
       <!-- GitHub sync status + buttons -->
       <div id="syncBar" class="syncbar">
-        <span id="syncStatus">Local only</span>
+        <span class="sync-info">
+          <span id="syncStatus">Local only</span>
+          <span id="lastSync" class="muted"></span>
+        </span>
         <span class="sync-actions">
           <button id="pullBtn" class="small-btn">Pull</button>
           <button id="pushBtn" class="small-btn">Push</button>
@@ -44,15 +47,28 @@
         <div class="section-heading">Register</div>
 
         <div class="summary-grid" id="registerSummary"></div>
+        <div class="hint" id="registerPeriodLabel"></div>
 
         <div class="toolbar">
           <button id="addIncomeBtn" class="primary-btn">+ Income</button>
           <button id="addExpenseBtn" class="primary-btn">+ Expense</button>
-          <button id="addBillingBtn" class="primary-btn">+ Billing Payment</button>
+          <button id="addBillingBtn" class="primary-btn">+ Insurance Payment</button>
         </div>
 
         <div class="register-controls">
-          <label>Filter
+          <label>Period
+            <select id="registerPeriod"></select>
+          </label>
+
+          <label>From
+            <input id="registerFrom" type="date">
+          </label>
+
+          <label>Through
+            <input id="registerThrough" type="date">
+          </label>
+
+          <label>Type
             <select id="registerFilter">
               <option value="all">All Types</option>
               <option value="income">Income</option>
@@ -68,7 +84,7 @@
           </label>
 
           <label>Search
-            <input id="registerSearch" type="search" placeholder="Description">
+            <input id="registerSearch" type="search" placeholder="Description, payer, ref #">
           </label>
 
           <label>Sort
@@ -93,29 +109,44 @@
                 <th>Type</th>
                 <th>Description</th>
                 <th>Category</th>
-                <th class="num">Gross Charges</th>
+                <th>Ref #</th>
+                <th class="num">Charges</th>
                 <th class="num">Expenses</th>
-                <th class="num">Revenue Reduction</th>
-                <th class="num">Balance</th>
+                <th class="num">Adjustment</th>
+                <th class="num">Cash Balance</th>
                 <th></th>
               </tr>
             </thead>
             <tbody id="registerBody"></tbody>
+            <tfoot id="registerFoot"></tfoot>
           </table>
         </div>
       </section>
 
       <!-- ============ BILLING ============ -->
       <section id="billingView" class="view">
-        <div class="section-heading">Insurance Billing</div>
+        <div class="section-heading">Insurance Claims</div>
+
+        <div class="summary-grid" id="billingSummary"></div>
 
         <div class="hint">
-          Track what was billed, what insurance actually paid, and the resulting revenue reduction.
+          Track each claim from billing to payment. A claim stays <b>Pending</b> until you record the
+          payment; only then does it count in the Register and on statements.
           No patient names or account numbers are stored.
         </div>
 
         <div class="toolbar">
-          <button id="newBillingBtn" class="primary-btn">+ New Billing</button>
+          <button id="newBillingBtn" class="primary-btn">+ New Claim</button>
+        </div>
+
+        <div class="register-controls">
+          <label>Show
+            <select id="billingFilter">
+              <option value="all">All Claims</option>
+              <option value="pending">Pending only</option>
+              <option value="paid">Paid only</option>
+            </select>
+          </label>
         </div>
 
         <div class="table-wrap">
@@ -123,10 +154,12 @@
             <thead>
               <tr>
                 <th>Service Date</th>
+                <th>Payer</th>
+                <th>Status</th>
                 <th>Payment Date</th>
                 <th class="num">Billed</th>
                 <th class="num">Received</th>
-                <th class="num">Revenue Reduction</th>
+                <th class="num">Adjustment</th>
                 <th></th>
               </tr>
             </thead>
@@ -139,10 +172,22 @@
       <section id="statementsView" class="view">
         <div class="section-heading">Statements</div>
 
+        <div class="hint">
+          A cash-basis Profit &amp; Loss statement. Insurance claims count in the period they are paid.
+          The CSV export lists every transaction in the period, for your accountant.
+        </div>
+
         <div class="form-grid statement-controls">
+          <label>Period
+            <select id="statementPeriod"></select>
+          </label>
           <label>From <input id="statementFrom" type="date"></label>
           <label>Through <input id="statementThrough" type="date"></label>
+        </div>
+
+        <div class="toolbar">
           <button id="statementBtn" class="primary-btn">Create PDF Statement</button>
+          <button id="csvBtn" class="primary-btn">Export CSV</button>
         </div>
 
         <div id="statementPreview" class="statement-preview"></div>
@@ -209,7 +254,7 @@
           <!-- Expense categories -->
           <div class="panel">
             <h2>Expense Categories</h2>
-            <p class="hint">Create your own categories. They appear in Expense entries and Register filters, and they sync with your ledger.</p>
+            <p class="hint">Categories for money spent. They appear in Expense entries and Register filters, and they sync with your ledger.</p>
 
             <div class="category-add">
               <input id="newCategory" placeholder="e.g. Advertising" autocomplete="off">
@@ -217,6 +262,19 @@
             </div>
 
             <div id="categoryList" class="category-list"></div>
+          </div>
+
+          <!-- Income categories -->
+          <div class="panel">
+            <h2>Income Categories</h2>
+            <p class="hint">Categories for money received other than through insurance claims. Claims always report under “Insurance Payments”.</p>
+
+            <div class="category-add">
+              <input id="newIncomeCategory" placeholder="e.g. Consulting" autocomplete="off">
+              <button id="addIncomeCategoryBtn" class="primary-btn">Add</button>
+            </div>
+
+            <div id="incomeCategoryList" class="category-list"></div>
           </div>
 
           <!-- Local data / backup -->
@@ -253,7 +311,7 @@
     <form method="dialog" id="entryForm" class="dialog-form">
       <div class="dialog-title">
         <span id="dialogTitle">New Entry</span>
-        <button value="cancel" class="close-btn">×</button>
+        <button type="button" id="closeEntryBtn" class="close-btn" aria-label="Close">×</button>
       </div>
 
       <div id="entryFields"></div>
@@ -261,6 +319,7 @@
       <div class="dialog-actions">
         <button type="button" id="cancelEntryBtn">Cancel</button>
         <button id="saveEntryBtn" value="default" class="primary-btn">Save</button>
+        <button id="saveAddBtn" value="again" class="primary-btn">Save &amp; Add Another</button>
       </div>
     </form>
   </dialog>

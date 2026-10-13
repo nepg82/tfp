@@ -253,7 +253,7 @@ td.num {
 
 .form-grid {
   display: grid;
-  grid-template-columns: 1fr 1fr auto;
+  grid-template-columns: 1fr 1fr 1fr;
   gap: 10px;
   align-items: end;
 }
@@ -721,4 +721,92 @@ button:active {
 
 .syncbar {
   top: 73px;   /* title bar + tabs */
+}
+
+
+/* ==========================================================================
+   v1.0.5 additions: P&L statement layout, claims, sync bar, register footer
+   ========================================================================== */
+
+[hidden] {
+  display: none !important;
+}
+
+.muted {
+  font-size: 11px;
+  color: #555;
+}
+
+/* Secondary line under a description (the payer / payee) */
+.sub {
+  font-size: 11px;
+  color: #555;
+}
+
+.status-pending {
+  font-weight: bold;
+}
+
+.summary .value.negative {
+  color: #900;
+}
+
+/* Sync bar: status + last-synced time on the left, buttons on the right */
+.sync-info {
+  display: flex;
+  gap: 10px;
+  align-items: baseline;
+}
+
+/* Totals row at the bottom of the Register */
+tfoot td {
+  font-weight: bold;
+  background: #ddd;
+  border-top: 2px solid #111;
+  border-bottom: 0;
+}
+
+.statement-preview .statement-period {
+  text-align: right;
+}
+
+/* Heading between statement parts (Expense Detail) */
+.statement-preview .statement-section-title {
+  margin-top: 22px;
+  font-weight: bold;
+  font-size: 14px;
+}
+
+/* Profit & Loss table */
+.statement-preview .pl-sub td {
+  background: #ddd;
+  font-weight: bold;
+  font-size: 11px;
+  text-transform: uppercase;
+}
+
+.statement-preview .pl-item {
+  padding-left: 22px;
+}
+
+.statement-preview .pl-total td {
+  font-weight: bold;
+  border-top: 1px solid #111;
+}
+
+.statement-preview .pl-grand td {
+  font-weight: bold;
+  font-size: 14px;
+  border-top: 2px solid #111;
+  border-bottom: 3px double #111;
+}
+
+/* The P&L is a formal summary: no zebra striping (must stay after the striping rule above) */
+.statement-preview .statement-section.pl tbody tr {
+  background: none;
+}
+
+.statement-preview .pl-sub td,
+.statement-preview .pl-sub td:last-child {
+  background: #ddd;
 }

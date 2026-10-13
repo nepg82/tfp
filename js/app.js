@@ -5,27 +5,34 @@
    optionally be backed up to a private GitHub repo as an AES-GCM encrypted file.
 
    Record types stored in IndexedDB (all have id, createdAt, updatedAt):
-     income     { date, amount, description }
-     expense    { date, amount, category, description }
-     category   { name }            <- an expense category (synced like any record)
-     billing    { serviceDate, paymentDate, billedAmount, receivedAmount, description }
+     income     { date, amount, category, payer, reference, description }
+     expense    { date, amount, category, payer, reference, description }
+     billing    { serviceDate, billedAmount, status: 'pending' | 'paid',
+                  paymentDate, receivedAmount,        <- only when paid
+                  payer, reference, description }
+     category   { name, kind: 'expense' | 'income' }  (synced like any record)
      tombstone  { id, deletedAt }   <- marks a deleted record so deletes sync
+
+   Accounting basis: CASH. A billing claim counts in the register and on
+   statements on its payment date. Pending (unpaid) claims appear only on the
+   Billing tab and as a memo line on statements.
 
    Sections in this file:
      1. Constants & state
      2. Small helpers
      3. IndexedDB
      4. Settings (localStorage)
-     5. Expense categories (synced records)
-     6. Register / billing / summary rendering
-     7. Add / edit / delete entries
-     8. Register filter controls
-     9. Statements (preview + shared calculations)
-    10. Encryption
-    11. GitHub sync (push / pull / merge)
-    12. Import / export / clear + button wiring
-    13. PDF statement generator
-    14. Startup
+     5. Categories (synced records)
+     6. Date periods (presets)
+     7. Register / billing / summary rendering
+     8. Add / edit / delete entries
+     9. Register filter controls
+    10. Statements (preview, shared calculations, CSV)
+    11. Encryption
+    12. GitHub sync (push / pull / merge)
+    13. Import / export / clear + button wiring
+    14. PDF statement generator
+    15. Startup
    ========================================================================== */
 
 
@@ -38,22 +45,30 @@ const DB_VERSION = 1;
 const STORE = 'records';
 
 const SETTINGS_KEY = 'tfp-ledger-settings';
+const LAST_SYNC_KEY = 'tfp-last-sync';
 
 // Categories used to live in localStorage. They are now ordinary records so they sync.
-// These two keys are only used to migrate an older device's list (see migrateCategories).
+// These keys are only used for one-time migrations (see migrateCategories).
 const LEGACY_CATEGORIES_KEY = 'tfp-ledger-expense-categories';
 const CATEGORIES_MIGRATED_KEY = 'tfp-ledger-categories-migrated';
-
-// Record types that show up in the register, billing list, and statements
-const LEDGER_TYPES = ['income', 'expense', 'billing'];
+const INCOME_CATEGORIES_SEEDED_KEY = 'tfp-ledger-income-categories-seeded';
 
 const DEFAULT_CATEGORIES = [
   'Fees', 'Advertising', 'Office Supplies', 'Software', 'Professional Services',
   'Rent', 'Utilities', 'Insurance', 'Travel', 'Other'
 ];
+const DEFAULT_INCOME_CATEGORIES = ['Insurance Payments', 'Self-Pay', 'Other Income'];
+
+// Insurance claims always report under this income category
+const BILLING_CATEGORY = 'Insurance Payments';
+// Income entered before income categories existed is reported under this one
+const FALLBACK_INCOME_CATEGORY = 'Other Income';
+
+// Record types that show up in the register, billing list, and statements
+const LEDGER_TYPES = ['income', 'expense', 'billing'];
 
 let db;                          // the open IndexedDB connection
-let records = [];                // in-memory copy of every record (including tombstones)
+let records = [];                // in-memory copy of every record (including categories and tombstones)
 let editingId = null;            // id of the record being edited, or null for a new one
 let registerAscending = false;   // register sort direction (false = newest/highest first)
 
@@ -69,6 +84,12 @@ const $ = id => document.getElementById(id);
 const money = n =>
   Number(n || 0).toLocaleString('en-US', { style: 'currency', currency: 'USD' });
 
+// Accounting style: negatives in parentheses, -50 -> "($50.00)"
+const moneyAcct = n => (n < 0 ? `(${money(-n)})` : money(n));
+
+// CSS class to add to a cell showing a possibly-negative amount
+const negClass = n => (n < 0 ? ' negative' : '');
+
 // "2026-03-05" -> "Mar 5, 2026" (noon avoids timezone date-shifting)
 const dateFmt = s =>
   s
@@ -77,8 +98,17 @@ const dateFmt = s =>
 
 const uid = () => crypto.randomUUID();
 
-// Today as "YYYY-MM-DD" (note: based on UTC, as in the original)
-const today = () => new Date().toISOString().slice(0, 10);
+// A Date as "YYYY-MM-DD" in the user's own time zone
+const localISO = d =>
+  `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+
+const today = () => localISO(new Date());
+
+// Whole days from a "YYYY-MM-DD" date until today
+function daysSince(dateStr) {
+  const ms = new Date(today() + 'T12:00:00') - new Date(dateStr + 'T12:00:00');
+  return Math.max(0, Math.round(ms / 86400000));
+}
 
 // Escape text before inserting it into HTML
 function esc(s) {
@@ -100,15 +130,26 @@ function activeRecords() {
   return records.filter(r => LEDGER_TYPES.includes(r.type));
 }
 
-// The date a record "counts" on: payment date for billing, otherwise its date
+// A claim that has been billed but not yet paid
+const isPending = r => r.type === 'billing' && r.status === 'pending';
+
+// The date a record "counts" on: payment date for billing, otherwise its date.
+// (Pending claims have no payment date, so they have no counting date yet.)
 function recordDate(r) {
   return r.type === 'billing' ? r.paymentDate : r.date;
 }
 
-// How much insurance paid less than was billed (never negative)
-function revenueReduction(r) {
+// Amount billed minus amount received (never negative)
+function adjustmentOf(r) {
   return Math.max(0, Number(r.billedAmount) - Number(r.receivedAmount));
 }
+
+function incomeCategoryOf(r) {
+  return r.category || FALLBACK_INCOME_CATEGORY;
+}
+
+// True if a "YYYY-MM-DD" date is within [from, to]; either bound may be empty
+const inRange = (d, from, to) => !!d && (!from || d >= from) && (!to || d <= to);
 
 
 /* ==========================================================================
@@ -194,35 +235,44 @@ function saveSettings() {
 
 
 /* ==========================================================================
-   5. Expense categories
-   Each category is its own record, { id: 'category:<lowercase name>', type: 'category',
-   name }, so categories sync through GitHub like everything else. Deleting one
-   writes a tombstone with the same id. `categories` is just a sorted list of names,
-   rebuilt from `records` every time the screen refreshes.
+   5. Categories (synced records)
+   Each category is its own record,
+     { id: 'category:<lowercase name>' (expense) or 'category:income:<lowercase name>',
+       type: 'category', kind: 'expense' | 'income', name }
+   so categories sync through GitHub like everything else. Deleting one writes a
+   tombstone with the same id. Records saved before income categories existed have
+   no `kind` and are expense categories.
+   `categories` and `incomeCategories` are sorted lists of names, rebuilt from
+   `records` every time the screen refreshes.
    ========================================================================== */
 
-let categories = [];
+let categories = [];          // expense category names
+let incomeCategories = [];    // income category names
 
-const categoryId = name => 'category:' + name.trim().toLowerCase();
+const categoryId = (name, kind = 'expense') =>
+  (kind === 'income' ? 'category:income:' : 'category:') + name.trim().toLowerCase();
 
 function rebuildCategories() {
-  categories = records
-    .filter(r => r.type === 'category')
+  const names = kind => records
+    .filter(r => r.type === 'category' && (r.kind || 'expense') === kind)
     .map(r => r.name)
     .sort((a, b) => a.localeCompare(b));
+
+  categories = names('expense');
+  incomeCategories = names('income');
 }
 
-async function addCategory(name) {
+async function addCategory(name, kind) {
   const now = Date.now();
-  await putMany([{ id: categoryId(name), type: 'category', name, createdAt: now, updatedAt: now }]);
+  await putMany([{ id: categoryId(name, kind), type: 'category', kind, name, createdAt: now, updatedAt: now }]);
   records = await getAll();
   refresh();
   setSyncDirty();
 }
 
-async function deleteCategory(name) {
+async function deleteCategory(name, kind) {
   const now = Date.now();
-  await putMany([{ id: categoryId(name), type: 'tombstone', deletedAt: now, updatedAt: now }]);
+  await putMany([{ id: categoryId(name, kind), type: 'tombstone', deletedAt: now, updatedAt: now }]);
   records = await getAll();
   refresh();
   setSyncDirty();
@@ -230,11 +280,11 @@ async function deleteCategory(name) {
 
 // Create records for the given names, skipping any that already exist (or were deleted).
 // Timestamps are 0, so any real add or delete, here or on another device, always wins.
-async function seedCategories(names) {
+async function seedCategories(names, kind = 'expense') {
   const existingIds = new Set(records.map(r => r.id));
   const items = [...new Set(names.map(n => String(n).trim()).filter(Boolean))]
-    .filter(n => !existingIds.has(categoryId(n)))
-    .map(n => ({ id: categoryId(n), type: 'category', name: n, createdAt: 0, updatedAt: 0 }));
+    .filter(n => !existingIds.has(categoryId(n, kind)))
+    .map(n => ({ id: categoryId(n, kind), type: 'category', kind, name: n, createdAt: 0, updatedAt: 0 }));
 
   if (items.length) {
     await putMany(items);
@@ -242,61 +292,161 @@ async function seedCategories(names) {
   }
 }
 
-// One-time upgrade: older versions kept categories in localStorage.
-// Convert that list (or the starter list on a brand-new device) into records.
+// One-time upgrades, tracked by flags in localStorage:
+//  1. Older versions kept expense categories in localStorage. Convert that list
+//     (or the starter list on a brand-new device) into records.
+//  2. Add the starter income categories.
 async function migrateCategories() {
-  if (localStorage.getItem(CATEGORIES_MIGRATED_KEY)) return;
+  if (!localStorage.getItem(CATEGORIES_MIGRATED_KEY)) {
+    let names = DEFAULT_CATEGORIES;
+    try {
+      const saved = JSON.parse(localStorage.getItem(LEGACY_CATEGORIES_KEY) || 'null');
+      if (Array.isArray(saved) && saved.length) names = saved;
+    } catch { /* use the starter list */ }
 
-  let names = DEFAULT_CATEGORIES;
-  try {
-    const saved = JSON.parse(localStorage.getItem(LEGACY_CATEGORIES_KEY) || 'null');
-    if (Array.isArray(saved) && saved.length) names = saved;
-  } catch { /* use the starter list */ }
+    await seedCategories(names, 'expense');
+    localStorage.setItem(CATEGORIES_MIGRATED_KEY, '1');
+  }
 
-  await seedCategories(names);
-  localStorage.setItem(CATEGORIES_MIGRATED_KEY, '1');
+  if (!localStorage.getItem(INCOME_CATEGORIES_SEEDED_KEY)) {
+    await seedCategories(DEFAULT_INCOME_CATEGORIES, 'income');
+    localStorage.setItem(INCOME_CATEGORIES_SEEDED_KEY, '1');
+  }
 }
 
-// The list with Delete buttons in Settings
+// The two lists with Delete buttons in Settings
 function renderCategories() {
-  const el = $('categoryList');
-  if (!el) return;
+  const draw = (elId, names, kind) => {
+    const el = $(elId);
+    if (!el) return;
 
-  el.innerHTML = categories.length
-    ? categories.map(c => `
-        <div class="category-item">
-          <span>${esc(c)}</span>
-          <button type="button" class="delete-link" data-category-delete="${esc(c)}">Delete</button>
-        </div>`).join('')
-    : '<div class="hint">No categories defined.</div>';
+    el.innerHTML = names.length
+      ? names.map(c => `
+          <div class="category-item">
+            <span>${esc(c)}</span>
+            <button type="button" class="delete-link" data-category-delete="${esc(c)}" data-category-kind="${kind}">Delete</button>
+          </div>`).join('')
+      : '<div class="hint">No categories defined.</div>';
+  };
+
+  draw('categoryList', categories, 'expense');
+  draw('incomeCategoryList', incomeCategories, 'income');
 }
 
-// The category dropdown in the Register filters (keeps the current choice if still valid)
+// Every category name worth offering as a filter: the current list, plus any name
+// still used by an existing entry (so old entries stay filterable after a delete).
+function categoryChoices(kind) {
+  const used = records
+    .filter(r => r.type === kind && r.category)
+    .map(r => r.category);
+  const base = kind === 'income'
+    ? [...incomeCategories, BILLING_CATEGORY, FALLBACK_INCOME_CATEGORY, ...used]
+    : [...categories, ...used];
+  return [...new Set(base)].sort((a, b) => a.localeCompare(b));
+}
+
+// The Register's category dropdown. Values look like "income:Self-Pay" or "expense:Rent",
+// so an income category and an expense category can never be confused.
 function populateRegisterCategory() {
   const el = $('registerCategory');
   if (!el) return;
 
   const previous = el.value;
+  const options = kind => categoryChoices(kind)
+    .map(c => `<option value="${esc(kind + ':' + c)}">${esc(c)}</option>`)
+    .join('');
+
   el.innerHTML =
     '<option value="all">All Categories</option>' +
-    categories.map(c => `<option value="${esc(c)}">${esc(c)}</option>`).join('');
-  el.value = categories.includes(previous) ? previous : 'all';
+    `<optgroup label="Income">${options('income')}</optgroup>` +
+    `<optgroup label="Expenses">${options('expense')}</optgroup>`;
+
+  el.value = [...el.options].some(o => o.value === previous) ? previous : 'all';
 }
 
 
 /* ==========================================================================
-   6. Register / billing / summary rendering
+   6. Date periods (presets used by the Register and Statements)
    ========================================================================== */
 
-// Turn each record into a uniform "row" for the register table.
-//   gross     = what was charged / received before insurance shortfalls
+const PERIOD_OPTIONS = [
+  ['thisMonth', 'This Month'],
+  ['lastMonth', 'Last Month'],
+  ['thisQuarter', 'This Quarter'],
+  ['lastQuarter', 'Last Quarter'],
+  ['ytd', 'Year to Date'],
+  ['lastYear', 'Last Year']
+];
+
+// { from, to } for a preset name, or null for "custom"
+function periodRange(key) {
+  const now = new Date();
+  const y = now.getFullYear();
+  const m = now.getMonth();
+  const range = (a, b) => ({ from: localISO(a), to: localISO(b) });
+
+  switch (key) {
+    case 'thisMonth':   return range(new Date(y, m, 1), new Date(y, m + 1, 0));
+    case 'lastMonth':   return range(new Date(y, m - 1, 1), new Date(y, m, 0));
+    case 'thisQuarter': { const q = Math.floor(m / 3) * 3;     return range(new Date(y, q, 1), new Date(y, q + 3, 0)); }
+    case 'lastQuarter': { const q = Math.floor(m / 3) * 3 - 3; return range(new Date(y, q, 1), new Date(y, q + 3, 0)); }
+    case 'ytd':         return range(new Date(y, 0, 1), now);
+    case 'lastYear':    return range(new Date(y - 1, 0, 1), new Date(y - 1, 11, 31));
+    default:            return null;
+  }
+}
+
+function populatePeriodSelects() {
+  const options = PERIOD_OPTIONS.map(([key, label]) => `<option value="${key}">${label}</option>`).join('');
+  $('registerPeriod').innerHTML = '<option value="all">All Time</option>' + options + '<option value="custom">Custom</option>';
+  $('statementPeriod').innerHTML = options + '<option value="custom">Custom</option>';
+}
+
+// Wire a period dropdown to its two date inputs.
+// Picking a preset fills the dates; editing a date switches the dropdown to "Custom".
+function linkPeriodControls(selectId, fromId, toId, onChange) {
+  const select = $(selectId);
+
+  select.onchange = () => {
+    const range = select.value === 'all' ? { from: '', to: '' } : periodRange(select.value);
+    if (range) {
+      $(fromId).value = range.from;
+      $(toId).value = range.to;
+    }
+    onChange();
+  };
+
+  const custom = () => {
+    select.value = 'custom';
+    onChange();
+  };
+  $(fromId).addEventListener('change', custom);
+  $(toId).addEventListener('change', custom);
+}
+
+function setPeriod(selectId, key) {
+  $(selectId).value = key;
+  $(selectId).onchange();
+}
+
+
+/* ==========================================================================
+   7. Register / billing / summary rendering
+   ========================================================================== */
+
+// Turn each PAID record into a uniform "row" for the register table.
+//   gross     = amount charged (billed), or income received
 //   expense   = money spent
-//   reduction = billed minus received
+//   reduction = billed minus received (the adjustment)
 //   cash      = actual money movement (used for the running balance)
+// Pending claims are not in the register: no money has moved yet.
 function registerRows() {
-  return activeRecords().map(r => {
+  return activeRecords().filter(r => !isPending(r)).map(r => {
     const isBilling = r.type === 'billing';
     const isExpense = r.type === 'expense';
+    const category = isExpense
+      ? (r.category || 'Uncategorized')
+      : isBilling ? BILLING_CATEGORY : incomeCategoryOf(r);
 
     return {
       id: r.id,
@@ -304,18 +454,40 @@ function registerRows() {
       date: recordDate(r),
       type: isBilling ? 'Billing' : isExpense ? 'Expense' : 'Income',
       desc: r.description || (isBilling ? 'Insurance payment' : isExpense ? 'Expense' : 'Income'),
-      category: isExpense ? r.category : (isBilling ? 'Insurance' : 'Income'),
+      category,
+      catKey: (isExpense ? 'expense:' : 'income:') + category,
+      payer: r.payer || '',
+      ref: r.reference || '',
       gross: isExpense ? 0 : isBilling ? Number(r.billedAmount) : Number(r.amount),
       expense: isExpense ? Number(r.amount) : 0,
-      reduction: isBilling ? revenueReduction(r) : 0,
+      reduction: isBilling ? adjustmentOf(r) : 0,
       cash: isExpense ? -Number(r.amount) : isBilling ? Number(r.receivedAmount) : Number(r.amount)
     };
   });
 }
 
+function sumRows(rows) {
+  return rows.reduce(
+    (t, r) => ({
+      gross: t.gross + r.gross,
+      expense: t.expense + r.expense,
+      reduction: t.reduction + r.reduction,
+      cash: t.cash + r.cash
+    }),
+    { gross: 0, expense: 0, reduction: 0, cash: 0 }
+  );
+}
+
+// Rows within the Register's selected period (before type/category/search filters)
+function periodRegisterRows() {
+  const from = $('registerFrom').value;
+  const to = $('registerThrough').value;
+  return registerRows().filter(r => inRange(r.date, from, to));
+}
+
 // Apply the Register's type / category / search / sort controls
 function filteredRegisterRows() {
-  let rows = registerRows();
+  let rows = periodRegisterRows();
 
   const type = $('registerFilter').value;
   const category = $('registerCategory').value;
@@ -323,8 +495,11 @@ function filteredRegisterRows() {
   const sortKey = $('registerSort').value;
 
   if (type !== 'all') rows = rows.filter(r => r.raw.type === type);
-  if (category !== 'all') rows = rows.filter(r => r.category === category);
-  if (search) rows = rows.filter(r => `${r.desc} ${r.category}`.toLowerCase().includes(search));
+  if (category !== 'all') rows = rows.filter(r => r.catKey === category);
+  if (search) {
+    rows = rows.filter(r =>
+      `${r.desc} ${r.category} ${r.payer} ${r.ref}`.toLowerCase().includes(search));
+  }
 
   // The value each row is sorted by
   const sortValue = r => {
@@ -365,62 +540,111 @@ function renderRegister() {
   }
 
   $('registerBody').innerHTML = rows.length
-    ? rows.map(r => `
+    ? rows.map(r => {
+        const bal = balanceById.get(r.id) || 0;
+        return `
         <tr>
           <td>${dateFmt(r.date)}</td>
           <td>${r.type}</td>
-          <td>${esc(r.desc)}</td>
+          <td>${esc(r.desc)}${r.payer ? `<div class="sub">${esc(r.payer)}</div>` : ''}</td>
           <td class="category">${esc(r.category)}</td>
+          <td>${esc(r.ref)}</td>
           <td class="num">${r.gross ? money(r.gross) : ''}</td>
           <td class="num">${r.expense ? money(r.expense) : ''}</td>
           <td class="num">${r.reduction ? money(r.reduction) : ''}</td>
-          <td class="num">${money(balanceById.get(r.id) || 0)}</td>
+          <td class="num${negClass(bal)}">${moneyAcct(bal)}</td>
           <td>
             <button class="edit-link" data-edit="${r.id}">Edit</button>
             <button class="delete-link" data-delete="${r.id}">Delete</button>
           </td>
-        </tr>`).join('')
-    : '<tr><td colspan="9">No transactions match the current filters.</td></tr>';
+        </tr>`;
+      }).join('')
+    : '<tr><td colspan="10">No transactions match the current filters.</td></tr>';
+
+  // Totals for the rows currently shown
+  const t = sumRows(rows);
+  $('registerFoot').innerHTML = rows.length
+    ? `<tr>
+         <td colspan="5">Totals for ${rows.length} transaction${rows.length === 1 ? '' : 's'} shown</td>
+         <td class="num">${money(t.gross)}</td>
+         <td class="num">${money(t.expense)}</td>
+         <td class="num">${money(t.reduction)}</td>
+         <td></td><td></td>
+       </tr>`
+    : '';
 }
 
 function renderBilling() {
-  const billing = activeRecords()
-    .filter(r => r.type === 'billing')
+  const filter = $('billingFilter').value;   // all | pending | paid
+  const claims = activeRecords().filter(r => r.type === 'billing');
+
+  // Summary cards: what is still owed to us, as of today
+  const pending = claims.filter(isPending);
+  const outstanding = pending.reduce((sum, r) => sum + Number(r.billedAmount), 0);
+  const oldest = pending.reduce((max, r) => Math.max(max, daysSince(r.serviceDate)), 0);
+
+  $('billingSummary').innerHTML = [
+    ['Outstanding claims', money(outstanding)],
+    ['Pending claims', String(pending.length)],
+    ['Oldest unpaid', pending.length ? `${oldest} day${oldest === 1 ? '' : 's'}` : '—']
+  ].map(([label, value]) => `
+    <div class="summary">
+      <div class="label">${label}</div>
+      <div class="value">${value}</div>
+    </div>`).join('');
+
+  const shown = claims
+    .filter(r => filter === 'all' || (filter === 'pending') === isPending(r))
     .sort((a, b) => (a.serviceDate || '').localeCompare(b.serviceDate || ''));
 
-  $('billingBody').innerHTML = billing.length
-    ? billing.map(r => `
+  $('billingBody').innerHTML = shown.length
+    ? shown.map(r => {
+        const pend = isPending(r);
+        const days = pend ? daysSince(r.serviceDate) : 0;
+        return `
         <tr>
           <td>${dateFmt(r.serviceDate)}</td>
-          <td>${dateFmt(r.paymentDate)}</td>
+          <td>${esc(r.payer || '')}</td>
+          <td class="${pend ? 'status-pending' : ''}">${pend ? `Pending · ${days} day${days === 1 ? '' : 's'}` : 'Paid'}</td>
+          <td>${pend ? '' : dateFmt(r.paymentDate)}</td>
           <td class="num">${money(r.billedAmount)}</td>
-          <td class="num">${money(r.receivedAmount)}</td>
-          <td class="num">${money(revenueReduction(r))}</td>
+          <td class="num">${pend ? '' : money(r.receivedAmount)}</td>
+          <td class="num">${pend ? '' : money(adjustmentOf(r))}</td>
           <td>
+            ${pend ? `<button class="edit-link" data-markpaid="${r.id}">Record Payment</button>` : ''}
             <button class="edit-link" data-edit="${r.id}">Edit</button>
             <button class="delete-link" data-delete="${r.id}">Delete</button>
           </td>
-        </tr>`).join('')
-    : '<tr><td colspan="6">No billing records yet.</td></tr>';
+        </tr>`;
+      }).join('')
+    : '<tr><td colspan="8">No claims to show.</td></tr>';
 }
 
-// The four totals across the top of the Register
+// The four totals across the top of the Register, for the selected period
 function renderSummary() {
-  const rows = registerRows();
-  const total = key => rows.reduce((sum, r) => sum + r[key], 0);
+  const from = $('registerFrom').value;
+  const to = $('registerThrough').value;
+  const rows = periodRegisterRows();
+  const t = sumRows(rows);
 
   const cards = [
-    ['Gross charges', total('gross')],
-    ['Expenses', total('expense')],
-    ['Revenue reduction', total('reduction')],
-    ['Net cash movement', total('cash')]
+    ['Charges', t.gross],
+    ['Expenses', t.expense],
+    ['Adjustments', t.reduction],
+    ['Net Cash Movement', t.cash]
   ];
 
   $('registerSummary').innerHTML = cards.map(([label, value]) => `
     <div class="summary">
       <div class="label">${label}</div>
-      <div class="value">${money(value)}</div>
+      <div class="value${negClass(value)}">${moneyAcct(value)}</div>
     </div>`).join('');
+
+  const span = from || to
+    ? `${from ? dateFmt(from) : 'the beginning'} – ${to ? dateFmt(to) : 'today'}`
+    : 'All dates';
+  $('registerPeriodLabel').textContent =
+    `Totals for ${span} · ${rows.length} transaction${rows.length === 1 ? '' : 's'}`;
 }
 
 // Redraw the whole UI from the current in-memory data
@@ -440,89 +664,145 @@ function refresh() {
 
 
 /* ==========================================================================
-   7. Add / edit / delete entries
+   8. Add / edit / delete entries
    ========================================================================== */
 
 // Describes the form fields for each kind of entry.
-// Each field: [id, label, input type, value, step (optional)]
+// Each field: { id, label, type, value, step, options (for selects) }
 function fieldsFor(kind, r = {}) {
-  const selectedCategory = categories.includes(r.category) ? r.category : '';
-  const categoryOptions = categories
-    .map(c => `<option value="${esc(c)}" ${c === selectedCategory ? 'selected' : ''}>${esc(c)}</option>`)
-    .join('');
+  // <option> list for a category dropdown. The entry's own category is always
+  // included, even if it has since been deleted, so editing never silently changes it.
+  const categoryOptions = (names, selected) => {
+    const all = selected && !names.includes(selected) ? [...names, selected] : names;
+    const placeholder = selected ? '' : '<option value="" disabled selected>Choose…</option>';
+    return placeholder + all
+      .map(c => `<option value="${esc(c)}" ${c === selected ? 'selected' : ''}>${esc(c)}</option>`)
+      .join('');
+  };
 
   if (kind === 'income') {
+    // Old income entries have no category; show them under the fallback one
+    const selected = r.category || (r.id ? FALLBACK_INCOME_CATEGORY : '');
     return [
-      ['date', 'Date', 'date', r.date || today()],
-      ['amount', 'Amount received', 'number', r.amount ?? '', '0.01'],
-      ['description', 'Description', 'text', r.description || '']
+      { id: 'date', label: 'Date', type: 'date', value: r.date || today() },
+      { id: 'amount', label: 'Amount received', type: 'number', value: r.amount ?? '', step: '0.01' },
+      { id: 'category', label: 'Category', type: 'select', options: categoryOptions(incomeCategories, selected) },
+      { id: 'payer', label: 'Payer (optional)', type: 'text', value: r.payer || '' },
+      { id: 'reference', label: 'Reference # (optional)', type: 'text', value: r.reference || '' },
+      { id: 'description', label: 'Description', type: 'text', value: r.description || '' }
     ];
   }
 
   if (kind === 'expense') {
     return [
-      ['date', 'Date', 'date', r.date || today()],
-      ['amount', 'Amount', 'number', r.amount ?? '', '0.01'],
-      ['category', 'Category', 'select', categoryOptions],
-      ['description', 'Description (optional)', 'text', r.description || '']
+      { id: 'date', label: 'Date', type: 'date', value: r.date || today() },
+      { id: 'amount', label: 'Amount', type: 'number', value: r.amount ?? '', step: '0.01' },
+      { id: 'category', label: 'Category', type: 'select', options: categoryOptions(categories, r.category || '') },
+      { id: 'payer', label: 'Payee (optional)', type: 'text', value: r.payer || '' },
+      { id: 'reference', label: 'Reference # (optional)', type: 'text', value: r.reference || '' },
+      { id: 'description', label: 'Description (optional)', type: 'text', value: r.description || '' }
     ];
   }
 
-  // billing
+  // billing (an insurance claim, pending or paid)
+  const status = r.status === 'pending' ? 'pending' : 'paid';
+  const statusOptions =
+    `<option value="pending" ${status === 'pending' ? 'selected' : ''}>Pending (billed, not yet paid)</option>` +
+    `<option value="paid" ${status === 'paid' ? 'selected' : ''}>Paid</option>`;
+
   return [
-    ['serviceDate', 'Service date', 'date', r.serviceDate || today()],
-    ['paymentDate', 'Payment received', 'date', r.paymentDate || today()],
-    ['billedAmount', 'Gross charges', 'number', r.billedAmount ?? '', '0.01'],
-    ['receivedAmount', 'Amount actually received', 'number', r.receivedAmount ?? '', '0.01'],
-    ['description', 'Description (optional)', 'text', r.description || '']
+    { id: 'serviceDate', label: 'Service date', type: 'date', value: r.serviceDate || today() },
+    { id: 'billedAmount', label: 'Amount billed (charges)', type: 'number', value: r.billedAmount ?? '', step: '0.01' },
+    { id: 'payer', label: 'Insurance payer (optional)', type: 'text', value: r.payer || '' },
+    { id: 'status', label: 'Status', type: 'select', options: statusOptions },
+    { id: 'paymentDate', label: 'Payment received', type: 'date', value: r.paymentDate || today() },
+    { id: 'receivedAmount', label: 'Amount actually received', type: 'number', value: r.receivedAmount ?? '', step: '0.01' },
+    { id: 'reference', label: 'Check / EFT # (optional)', type: 'text', value: r.reference || '' },
+    { id: 'description', label: 'Description (optional)', type: 'text', value: r.description || '' }
   ];
 }
 
-// Open the dialog to create (id = null) or edit (id = record id) an entry
-function openEntry(kind, id = null) {
+function entryTitle(kind, id, overrides) {
+  if (kind === 'income') return id ? 'Edit Income' : 'New Income';
+  if (kind === 'expense') return id ? 'Edit Expense' : 'New Expense';
+  if (id) return overrides.status === 'paid' ? 'Record Payment' : 'Edit Claim';
+  return overrides.status === 'pending' ? 'New Claim' : 'New Insurance Payment';
+}
+
+// Paid-only fields are hidden while a claim is pending
+function syncBillingFields() {
+  const status = $('f_status');
+  if (!status) return;
+  const pending = status.value === 'pending';
+  $('row_paymentDate').hidden = pending;
+  $('row_receivedAmount').hidden = pending;
+}
+
+// Fill the dialog's form for a new entry (id = null) or an existing one.
+// `overrides` are values to pre-set on top of the stored record.
+function renderEntryForm(kind, id = null, overrides = {}) {
   editingId = id;
-  const record = id ? records.find(x => x.id === id) : {};
-  if (id && !record) return;
+  const stored = id ? records.find(x => x.id === id) : null;
+  if (id && !stored) return false;
 
-  const titles = {
-    income: id ? 'Edit Income' : 'New Income',
-    expense: id ? 'Edit Expense' : 'New Expense',
-    billing: id ? 'Edit Billing Payment' : 'New Billing Payment'
-  };
-  $('dialogTitle').textContent = titles[kind];
+  const record = { ...(stored || {}), ...overrides };
 
-  $('entryFields').innerHTML = fieldsFor(kind, record).map(([fieldId, label, type, value, step]) => {
-    if (type === 'select') {
-      return `<div class="field"><label>${label}<select id="f_${fieldId}">${value}</select></label></div>`;
-    }
-    const stepAttr = step ? `step="${step}"` : '';
-    return `<div class="field"><label>${label}<input id="f_${fieldId}" type="${type}" value="${esc(value)}" ${stepAttr}></label></div>`;
+  $('dialogTitle').textContent = entryTitle(kind, id, overrides);
+  $('entryFields').innerHTML = fieldsFor(kind, record).map(f => {
+    const control = f.type === 'select'
+      ? `<select id="f_${f.id}">${f.options}</select>`
+      : `<input id="f_${f.id}" type="${f.type}" value="${esc(f.value)}" ${f.step ? `step="${f.step}"` : ''}>`;
+    return `<div class="field" id="row_${f.id}"><label>${f.label}${control}</label></div>`;
   }).join('');
 
   $('entryForm').dataset.kind = kind;
+  $('saveAddBtn').hidden = !!id;     // "Save & Add Another" only makes sense for new entries
+
+  if (kind === 'billing') {
+    $('f_status').onchange = syncBillingFields;
+    syncBillingFields();
+  }
+  return true;
+}
+
+function openEntry(kind, id = null, overrides = {}) {
+  if (!renderEntryForm(kind, id, overrides)) return;
   $('entryDialog').showModal();
 }
 
-$('cancelEntryBtn').onclick = () => {
+function closeEntryDialog() {
   $('entryDialog').close('cancel');
   editingId = null;
-};
+}
+
+$('cancelEntryBtn').onclick = closeEntryDialog;
+$('closeEntryBtn').onclick = closeEntryDialog;
+$('entryDialog').addEventListener('close', () => { editingId = null; });
 
 // Save button: read the form, validate, store, refresh
 $('entryForm').addEventListener('submit', async e => {
   e.preventDefault();
-  if (e.submitter && e.submitter.value === 'cancel') return;
-
+  const again = !!e.submitter && e.submitter.value === 'again';
   const kind = e.currentTarget.dataset.kind;
-  const r = editingId
-    ? records.find(x => x.id === editingId)
-    : { id: uid(), createdAt: Date.now(), type: kind };
-  if (!r) return;
+
+  // Work on a copy so a failed validation can't leave a half-edited record in memory
+  const existing = editingId ? records.find(x => x.id === editingId) : null;
+  if (editingId && !existing) return;
+  const r = existing ? { ...existing } : { id: uid(), createdAt: Date.now(), type: kind };
+
+  // Amount boxes can't be left blank (a blank would silently become $0.00)
+  const amountIds = kind === 'billing' ? ['billedAmount'] : ['amount'];
+  if (kind === 'billing' && $('f_status').value === 'paid') amountIds.push('receivedAmount');
+  if (amountIds.some(id => $('f_' + id).value.trim() === '')) {
+    alert('Enter the amount.');
+    return;
+  }
 
   if (kind === 'income') {
     r.date = $('f_date').value;
     r.amount = Number($('f_amount').value);
-    r.description = $('f_description').value.trim() || 'Income';
+    r.category = $('f_category').value;
+    r.description = $('f_description').value.trim() || r.category || 'Income';
   }
 
   if (kind === 'expense') {
@@ -534,21 +814,47 @@ $('entryForm').addEventListener('submit', async e => {
 
   if (kind === 'billing') {
     r.serviceDate = $('f_serviceDate').value;
-    r.paymentDate = $('f_paymentDate').value;
     r.billedAmount = Number($('f_billedAmount').value);
-    r.receivedAmount = Number($('f_receivedAmount').value);
-    r.description = $('f_description').value.trim() || 'Insurance payment';
+    r.status = $('f_status').value;
+    if (r.status === 'paid') {
+      r.paymentDate = $('f_paymentDate').value;
+      r.receivedAmount = Number($('f_receivedAmount').value);
+    } else {
+      delete r.paymentDate;
+      delete r.receivedAmount;
+    }
+    r.description = $('f_description').value.trim();
   }
 
+  r.payer = $('f_payer').value.trim();
+  r.reference = $('f_reference').value.trim();
   r.updatedAt = Date.now();
   if (!validate(r)) return;
 
   await putMany([r]);
   records = await getAll();
-  $('entryDialog').close('saved');
-  editingId = null;
+
+  if (again) {
+    // Keep the dialog open with a fresh form, carrying over the date for convenience
+    renderEntryForm(kind, null, kind === 'billing' ? { status: r.status } : { date: r.date });
+    const first = $('entryFields').querySelector('input,select');
+    if (first) first.focus();
+  } else {
+    $('entryDialog').close('saved');
+    editingId = null;
+  }
+
   refresh();
   setSyncDirty();
+
+  // Let the user know when a saved entry won't be visible in the current Register view
+  if (isPending(r)) {
+    toast('Claim saved. Pending claims are listed on the Billing tab.');
+  } else if (!inRange(recordDate(r), $('registerFrom').value, $('registerThrough').value)) {
+    toast('Saved. It falls outside the Register’s current period.');
+  } else if (again) {
+    toast('Saved.');
+  }
 });
 
 // Returns true if the record is OK to save; otherwise alerts and returns false
@@ -557,17 +863,29 @@ function validate(r) {
     alert('Choose a date.');
     return false;
   }
-  if (r.type === 'expense' && !r.category) {
-    alert('Choose an expense category.');
+  if ((r.type === 'income' || r.type === 'expense') && !r.category) {
+    alert(`Choose ${r.type === 'income' ? 'an income' : 'an expense'} category.`);
     return false;
   }
-  if (r.type === 'billing' && (!r.serviceDate || !r.paymentDate)) {
-    alert('Choose both service and payment dates.');
-    return false;
-  }
-  if (r.type === 'billing' && (r.billedAmount < 0 || r.receivedAmount < 0 || r.receivedAmount > r.billedAmount)) {
-    alert('Received amount must be between $0 and the gross charges.');
-    return false;
+  if (r.type === 'billing') {
+    if (!r.serviceDate) {
+      alert('Choose the service date.');
+      return false;
+    }
+    if (r.billedAmount < 0) {
+      alert('Amounts cannot be negative.');
+      return false;
+    }
+    if (r.status === 'paid') {
+      if (!r.paymentDate) {
+        alert('Choose the payment date.');
+        return false;
+      }
+      if (r.receivedAmount < 0 || r.receivedAmount > r.billedAmount) {
+        alert('Received amount must be between $0 and the amount billed.');
+        return false;
+      }
+    }
   }
   if ((r.amount ?? 0) < 0) {
     alert('Amounts cannot be negative.');
@@ -586,6 +904,14 @@ document.addEventListener('click', async e => {
     return;
   }
 
+  // Record the payment for a pending claim
+  const payBtn = e.target.closest('[data-markpaid]');
+  if (payBtn) {
+    const r = records.find(x => x.id === payBtn.dataset.markpaid);
+    if (r) openEntry('billing', r.id, { status: 'paid', paymentDate: today() });
+    return;
+  }
+
   // Delete a record (replaced by a "tombstone" so the delete syncs to other devices)
   const deleteBtn = e.target.closest('[data-delete]');
   if (deleteBtn) {
@@ -601,48 +927,62 @@ document.addEventListener('click', async e => {
     return;
   }
 
-  // Delete an expense category (existing expenses keep their category text)
+  // Delete a category (existing entries keep their category text)
   const categoryBtn = e.target.closest('[data-category-delete]');
   if (categoryBtn) {
     const name = categoryBtn.dataset.categoryDelete;
-    if (confirm(`Delete the category “${name}”? Existing expenses will keep their category.`)) {
-      await deleteCategory(name);
+    const kind = categoryBtn.dataset.categoryKind;
+    if (confirm(`Delete the category “${name}”? Existing entries will keep their category.`)) {
+      await deleteCategory(name, kind);
     }
   }
 });
 
-// Add-category box
-$('addCategoryBtn').onclick = async () => {
-  const input = $('newCategory');
-  const name = input.value.trim();
-  if (!name) return;
+// The "Add" box under a category list in Settings
+function wireCategoryAdd(inputId, buttonId, kind) {
+  const names = () => (kind === 'income' ? incomeCategories : categories);
 
-  if (categories.some(c => c.toLowerCase() === name.toLowerCase())) {
-    toast('That category already exists.');
-    return;
-  }
+  $(buttonId).onclick = async () => {
+    const input = $(inputId);
+    const name = input.value.trim();
+    if (!name) return;
 
-  await addCategory(name);
-  input.value = '';
-  input.focus();
-};
+    if (names().some(c => c.toLowerCase() === name.toLowerCase())) {
+      toast('That category already exists.');
+      return;
+    }
 
-$('newCategory').addEventListener('keydown', e => {
-  if (e.key === 'Enter') {
-    e.preventDefault();
-    $('addCategoryBtn').click();
-  }
-});
+    await addCategory(name, kind);
+    input.value = '';
+    input.focus();
+  };
+
+  $(inputId).addEventListener('keydown', e => {
+    if (e.key === 'Enter') {
+      e.preventDefault();
+      $(buttonId).click();
+    }
+  });
+}
+
+wireCategoryAdd('newCategory', 'addCategoryBtn', 'expense');
+wireCategoryAdd('newIncomeCategory', 'addIncomeCategoryBtn', 'income');
 
 
 /* ==========================================================================
-   8. Register filter controls
+   9. Register filter controls
    ========================================================================== */
 
 $('registerFilter').onchange = renderRegister;
 $('registerCategory').onchange = renderRegister;
 $('registerSort').onchange = renderRegister;
 $('registerSearch').oninput = renderRegister;
+
+// Changing the period affects both the table and the summary cards
+linkPeriodControls('registerPeriod', 'registerFrom', 'registerThrough', () => {
+  renderRegister();
+  renderSummary();
+});
 
 $('registerDirection').onclick = () => {
   registerAscending = !registerAscending;
@@ -657,20 +997,32 @@ $('clearRegisterFilters').onclick = () => {
   $('registerSort').value = 'date';
   registerAscending = false;
   $('registerDirection').textContent = 'Ascending ▲';
-  renderRegister();
+  setPeriod('registerPeriod', 'thisMonth');
 };
+
+$('billingFilter').onchange = renderBilling;
 
 
 /* ==========================================================================
-   9. Statements (shared by the on-screen preview and the PDF)
+   10. Statements (shared by the on-screen preview, the PDF, and the CSV)
    ========================================================================== */
 
-// Records whose date falls within [from, to] (inclusive, either bound optional)
+// Paid records whose counting date falls within [from, to] (inclusive)
 function recordsInRange(from, to) {
-  return activeRecords().filter(r => {
-    const d = recordDate(r);
-    return d && (!from || d >= from) && (!to || d <= to);
-  });
+  return activeRecords().filter(r => !isPending(r) && inRange(recordDate(r), from, to));
+}
+
+// Claims billed on or before `to` that had not yet been paid by `to`
+function outstandingAsOf(to) {
+  const open = activeRecords().filter(r =>
+    r.type === 'billing' &&
+    r.serviceDate && (!to || r.serviceDate <= to) &&
+    (isPending(r) || (to && r.paymentDate > to)));
+
+  return {
+    count: open.length,
+    amount: open.reduce((sum, r) => sum + Number(r.billedAmount), 0)
+  };
 }
 
 // Totals and groupings for a statement period
@@ -680,14 +1032,25 @@ function statementData(from, to) {
   const income = rs.filter(r => r.type === 'income');
   const expenses = rs.filter(r => r.type === 'expense');
 
-  const gross =
-    billing.reduce((sum, r) => sum + Number(r.billedAmount), 0) +
-    income.reduce((sum, r) => sum + Number(r.amount), 0);
-  const reduction = billing.reduce((sum, r) => sum + revenueReduction(r), 0);
-  const exp = expenses.reduce((sum, r) => sum + Number(r.amount), 0);
-  const net = gross - reduction - exp;
+  // Charges by income category: claims under "Insurance Payments", the rest by their own category
+  const byCategory = new Map();
+  const addIncome = (name, amount) => byCategory.set(name, (byCategory.get(name) || 0) + amount);
+  billing.forEach(r => addIncome(BILLING_CATEGORY, Number(r.billedAmount)));
+  income.forEach(r => addIncome(incomeCategoryOf(r), Number(r.amount)));
+  const incomeLines = [...byCategory.entries()].sort((a, b) => a[0].localeCompare(b[0]));
 
-  return { rs, billing, income, expenses, gross, reduction, exp, net, received: gross - reduction };
+  const gross = incomeLines.reduce((sum, [, amount]) => sum + amount, 0);
+  const reduction = billing.reduce((sum, r) => sum + adjustmentOf(r), 0);
+  const exp = expenses.reduce((sum, r) => sum + Number(r.amount), 0);
+
+  return {
+    rs, billing, income, expenses,
+    incomeLines, gross, reduction,
+    netRevenue: gross - reduction,
+    exp,
+    net: gross - reduction - exp,
+    outstanding: outstandingAsOf(to)
+  };
 }
 
 // Group expenses by category, categories sorted A-Z: [[category, [records]], ...]
@@ -701,6 +1064,8 @@ function expenseGroups(expenses) {
   return [...groups.entries()].sort((a, b) => a[0].localeCompare(b[0]));
 }
 
+const sumAmounts = items => items.reduce((sum, r) => sum + Number(r.amount), 0);
+
 // One statement transaction line: its date, description, and the three amounts
 function statementRow(r) {
   const isBilling = r.type === 'billing';
@@ -712,7 +1077,7 @@ function statementRow(r) {
     desc: r.description || (isBilling ? 'Insurance payment' : isExpense ? 'Expense' : 'Income'),
     gross: isBilling ? Number(r.billedAmount) : isIncome ? Number(r.amount) : 0,
     exp: isExpense ? Number(r.amount) : 0,
-    red: isBilling ? revenueReduction(r) : 0
+    red: isBilling ? adjustmentOf(r) : 0
   };
 }
 
@@ -731,8 +1096,67 @@ function renderStatementPreview() {
   }
 
   const d = statementData(from, to);
+  const expenseSets = expenseGroups(d.expenses);
 
-  // Transactions table body
+  // --- Profit & Loss ---
+  const incomeRows = d.incomeLines.length
+    ? d.incomeLines.map(([name, amount]) =>
+        `<tr><td class="pl-item">${esc(name)}</td><td class="num">${money(amount)}</td></tr>`).join('')
+    : '<tr><td class="pl-item empty">No income in this period.</td><td></td></tr>';
+
+  const expenseRows = expenseSets.length
+    ? expenseSets.map(([name, items]) =>
+        `<tr><td class="pl-item">${esc(name)}</td><td class="num">${money(sumAmounts(items))}</td></tr>`).join('')
+    : '<tr><td class="pl-item empty">No expenses in this period.</td><td></td></tr>';
+
+  const memo = d.outstanding.count
+    ? `Memo: ${d.outstanding.count} insurance claim${d.outstanding.count === 1 ? '' : 's'} billed but unpaid as of ${dateFmt(to)}, totaling ${money(d.outstanding.amount)}. Not included above (cash basis).`
+    : `Memo: no insurance claims were outstanding as of ${dateFmt(to)}.`;
+
+  const profitAndLoss = `
+    <div class="statement-section pl">
+      <h3>Profit &amp; Loss</h3>
+      <table>
+        <tbody>
+          <tr class="pl-sub"><td colspan="2">Income</td></tr>
+          ${incomeRows}
+          <tr class="pl-total"><td>Total Charges</td><td class="num">${money(d.gross)}</td></tr>
+          <tr><td class="pl-item">Less: Adjustments</td><td class="num">${moneyAcct(-d.reduction)}</td></tr>
+          <tr class="pl-total"><td>Net Revenue</td><td class="num${negClass(d.netRevenue)}">${moneyAcct(d.netRevenue)}</td></tr>
+          <tr class="pl-sub"><td colspan="2">Expenses</td></tr>
+          ${expenseRows}
+          <tr class="pl-total"><td>Total Expenses</td><td class="num">${money(d.exp)}</td></tr>
+          <tr class="pl-grand"><td>Net Income</td><td class="num${negClass(d.net)}">${moneyAcct(d.net)}</td></tr>
+        </tbody>
+      </table>
+      <div class="hint">${memo}</div>
+    </div>`;
+
+  // --- Expense detail: one small table per category ---
+  const expenseSections = expenseSets.map(([category, items]) => {
+    const lines = items
+      .sort((a, b) => a.date.localeCompare(b.date))
+      .map(r => `
+        <tr>
+          <td>${dateFmt(r.date)}</td>
+          <td>${esc(r.description || category)}</td>
+          <td class="num">${money(r.amount)}</td>
+        </tr>`).join('');
+
+    return `
+      <div class="statement-section">
+        <h3>${esc(category)}</h3>
+        <table>
+          <thead><tr><th>Date</th><th>Description</th><th class="num">Amount</th></tr></thead>
+          <tbody>
+            ${lines}
+            <tr class="statement-total"><td></td><td>Category Total</td><td class="num">${money(sumAmounts(items))}</td></tr>
+          </tbody>
+        </table>
+      </div>`;
+  }).join('');
+
+  // --- Transaction listing (everything, in date order) ---
   const transactionRows = statementRecordsSorted(d).map(r => {
     const row = statementRow(r);
     return `
@@ -745,79 +1169,76 @@ function renderStatementPreview() {
       </tr>`;
   }).join('');
 
-  // One small table per expense category
-  const expenseSections = expenseGroups(d.expenses).map(([category, items]) => {
-    const lines = items
-      .sort((a, b) => a.date.localeCompare(b.date))
-      .map(r => `
-        <tr>
-          <td>${dateFmt(r.date)}</td>
-          <td>${esc(r.description || category)}</td>
-          <td class="num">${money(r.amount)}</td>
-        </tr>`).join('');
-    const categoryTotal = items.reduce((sum, r) => sum + Number(r.amount), 0);
-
-    return `
-      <div class="statement-section">
-        <h3>${esc(category)}</h3>
-        <table>
-          <thead><tr><th>Date</th><th>Description</th><th class="num">Amount</th></tr></thead>
-          <tbody>
-            ${lines}
-            <tr class="statement-total"><td></td><td>Category Total</td><td class="num">${money(categoryTotal)}</td></tr>
-          </tbody>
-        </table>
-      </div>`;
-  }).join('');
-
   $('statementPreview').innerHTML = `
     <div class="statement-head">
       <div>
         <h2>True Faith Psychiatry</h2>
-        <div>Account Statement</div>
+        <div>Profit &amp; Loss Statement</div>
+        <div class="muted">Cash basis</div>
       </div>
-      <div class="nowrap">${dateFmt(from)} – ${dateFmt(to)}</div>
+      <div class="nowrap statement-period">
+        <div>${dateFmt(from)} – ${dateFmt(to)}</div>
+        <div class="muted">Prepared ${dateFmt(today())}</div>
+      </div>
     </div>
 
+    ${profitAndLoss}
+
+    <div class="statement-section-title">Expense Detail</div>
+    ${expenseSections || '<div class="empty">No expenses in this period.</div>'}
+
     <div class="statement-section">
-      <h3>Transactions</h3>
+      <h3>Transaction Listing</h3>
       <table>
         <thead>
           <tr>
             <th>Date</th><th>Description</th>
-            <th class="num">Gross Charges</th><th class="num">Expenses</th><th class="num">Revenue Reduction</th>
+            <th class="num">Charges</th><th class="num">Expenses</th><th class="num">Adjustment</th>
           </tr>
         </thead>
         <tbody>
           ${transactionRows || '<tr><td colspan="5" class="empty">No transactions in this period.</td></tr>'}
         </tbody>
       </table>
-    </div>
-
-    <div class="statement-section">
-      <h3>Expense Detail</h3>
-      ${expenseSections || '<div class="empty">No expenses in this period.</div>'}
-    </div>
-
-    <div class="summary-box">
-      <table>
-        <tbody>
-          <tr><td>Gross Charges</td><td class="num">${money(d.gross)}</td></tr>
-          <tr><td>Revenue Reduction</td><td class="num">${money(d.reduction)}</td></tr>
-          <tr><td>Net Revenue</td><td class="num">${money(d.gross - d.reduction)}</td></tr>
-          <tr><td>Total Expenses</td><td class="num">${money(d.exp)}</td></tr>
-          <tr class="grand"><td>Net Income</td><td class="num">${money(d.net)}</td></tr>
-        </tbody>
-      </table>
     </div>`;
 }
 
-$('statementFrom').addEventListener('change', renderStatementPreview);
-$('statementThrough').addEventListener('change', renderStatementPreview);
+linkPeriodControls('statementPeriod', 'statementFrom', 'statementThrough', renderStatementPreview);
+
+// --- CSV export (for the accountant) ---
+
+// Quote a text cell. Cells that start with = + - @ get a leading apostrophe so that
+// spreadsheet programs never treat typed text as a formula.
+function csvText(value) {
+  let s = String(value ?? '');
+  if (/^[=+\-@]/.test(s)) s = "'" + s;
+  return `"${s.replace(/"/g, '""')}"`;
+}
+
+const csvNum = n => Number(n || 0).toFixed(2);
+
+function buildCSV(from, to) {
+  const header = [
+    'Date', 'Type', 'Category', 'Description', 'Payer/Payee', 'Reference',
+    'Service Date', 'Charges', 'Adjustment', 'Expense', 'Net Cash'
+  ];
+
+  const rows = registerRows()
+    .filter(r => inRange(r.date, from, to))
+    .sort((a, b) => a.date.localeCompare(b.date) || a.id.localeCompare(b.id))
+    .map(r => [
+      r.date, csvText(r.type), csvText(r.category), csvText(r.desc), csvText(r.payer), csvText(r.ref),
+      r.raw.type === 'billing' ? r.raw.serviceDate : '',
+      csvNum(r.gross), csvNum(r.reduction), csvNum(r.expense), csvNum(r.cash)
+    ]);
+
+  // Leading BOM so Excel reads the file as UTF-8
+  return '\ufeff' + [header.map(csvText), ...rows].map(row => row.join(',')).join('\r\n') + '\r\n';
+}
 
 
 /* ==========================================================================
-   10. Encryption
+   11. Encryption
    Password -> PBKDF2 (SHA-256, 210,000 iterations) -> AES-256-GCM key.
    The encrypted file is JSON containing the salt, IV, and ciphertext (base64).
    ========================================================================== */
@@ -893,7 +1314,7 @@ async function decryptData(text, password) {
 
 
 /* ==========================================================================
-   11. GitHub sync
+   12. GitHub sync
    The encrypted ledger is stored as a single file in a private repo, using
    the GitHub "contents" API. Records are merged by id; newest edit wins.
    ========================================================================== */
@@ -960,6 +1381,17 @@ async function replaceLocalRecords(newRecords) {
   await putMany(records);
 }
 
+// Show when this device last synced successfully
+function showLastSync() {
+  const stamp = localStorage.getItem(LAST_SYNC_KEY);
+  $('lastSync').textContent = stamp ? `Last synced ${new Date(stamp).toLocaleString()}` : '';
+}
+
+function markSynced() {
+  localStorage.setItem(LAST_SYNC_KEY, new Date().toISOString());
+  showLastSync();
+}
+
 // Upload: fetch the remote copy, merge it with local, save locally, then encrypt and upload
 async function push() {
   saveSettings();
@@ -997,7 +1429,7 @@ async function push() {
   await gh('PUT', url, body);
 
   $('syncStatus').textContent = 'Synced';
-  localStorage.setItem('tfp-last-sync', new Date().toISOString());
+  markSynced();
   toast('Ledger pushed to GitHub.');
 }
 
@@ -1017,6 +1449,7 @@ async function pull() {
   refresh();
 
   $('syncStatus').textContent = 'Pulled + merged';
+  markSynced();
   toast(`Pulled ${remote.length} records and merged locally.`);
 }
 
@@ -1026,7 +1459,7 @@ function setSyncDirty() {
 
 
 /* ==========================================================================
-   12. Import / export / clear + button wiring
+   13. Import / export / clear + button wiring
    ========================================================================== */
 
 // Trigger a browser download of some text
@@ -1077,7 +1510,9 @@ $('clearBtn').onclick = async () => {
   if (confirm('Clear all local ledger data? This does not delete the GitHub copy.')) {
     await clearDB();
     records = [];
-    await seedCategories(DEFAULT_CATEGORIES);   // so the Expense form still has categories
+    // So the entry forms still have categories to choose from
+    await seedCategories(DEFAULT_CATEGORIES, 'expense');
+    await seedCategories(DEFAULT_INCOME_CATEGORIES, 'income');
     refresh();
     setSyncDirty();
     toast('Local ledger cleared.');
@@ -1106,21 +1541,34 @@ $('pullBtn').onclick = async () => {
 ['ghOwner', 'ghRepo', 'ghPath', 'ghToken', 'encPassword', 'rememberToken', 'rememberPassword']
   .forEach(id => $(id).addEventListener('change', saveSettings));
 
-// "Add" buttons
+// "Add" buttons. Claims added from the Billing tab start as pending;
+// the Register's button records a payment that has already arrived.
 $('addIncomeBtn').onclick = () => openEntry('income');
 $('addExpenseBtn').onclick = () => openEntry('expense');
-$('addBillingBtn').onclick = () => openEntry('billing');
-$('newBillingBtn').onclick = () => openEntry('billing');
+$('addBillingBtn').onclick = () => openEntry('billing', null, { status: 'paid' });
+$('newBillingBtn').onclick = () => openEntry('billing', null, { status: 'pending' });
 
-// Create PDF button
-$('statementBtn').onclick = () => {
+// A valid {from, to} from the Statements tab, or null (after alerting) if not
+function statementRangeOrAlert() {
   const from = $('statementFrom').value;
   const to = $('statementThrough').value;
   if (!from || !to || from > to) {
     alert('Choose a valid date range first.');
-    return;
+    return null;
   }
-  generatePDF(from, to);
+  return { from, to };
+}
+
+$('statementBtn').onclick = () => {
+  const range = statementRangeOrAlert();
+  if (range) generatePDF(range.from, range.to);
+};
+
+$('csvBtn').onclick = () => {
+  const range = statementRangeOrAlert();
+  if (range) {
+    downloadText(`tfp-ledger-${range.from}-to-${range.to}.csv`, buildCSV(range.from, range.to), 'text/csv');
+  }
 };
 
 // Tab navigation
@@ -1135,7 +1583,7 @@ document.querySelectorAll('.tab').forEach(tab => {
 
 
 /* ==========================================================================
-   13. PDF statement generator
+   14. PDF statement generator
    Builds a PDF by hand (no library): US Letter pages, Helvetica text only.
    Coordinates are in points; (0,0) is the bottom-left corner of the page.
 
@@ -1219,11 +1667,12 @@ function generatePDF(from, to) {
   const right = W - margin;          // right edge of the content area
   const usable = right - margin;     // width of the content area
   const cellPad = 5;                 // space between a column line and its text
+  const amountRight = right - cellPad;
 
   const HEADER_GRAY = .88;           // table header bands
   const STRIPE_GRAY = .93;           // alternating row shading
 
-  const pages = [];                  // finished pages
+  const pages = [];                  // finished pages: { gfx, txt }
   let gfx = '';                      // shapes for the current page
   let txt = '';                      // text for the current page
   let y = H - 42;                    // current vertical position (moves down the page)
@@ -1232,9 +1681,10 @@ function generatePDF(from, to) {
 
   const header = () => {
     txt += pdfText(margin, y, 'TRUE FAITH PSYCHIATRY', 17);
-    txt += pdfText(W - margin - 130, y, 'ACCOUNT STATEMENT', 9);
+    txt += pdfTextRight(right, y, 'PROFIT & LOSS STATEMENT', 9);
     y -= 23;
     txt += pdfText(margin, y, `${dateFmt(from)} - ${dateFmt(to)}`, 10);
+    txt += pdfTextRight(right, y, 'Cash basis', 9);
     gfx += pdfLine(margin, y - 8, W - margin, y - 8);
     y -= 25;
   };
@@ -1247,7 +1697,7 @@ function generatePDF(from, to) {
   };
 
   const finishPage = () => {
-    pages.push(`${gfx}BT\n${txt}ET`);
+    pages.push({ gfx, txt });
   };
 
   // Start a new page if fewer than `need` points remain
@@ -1304,63 +1754,64 @@ function generatePDF(from, to) {
     y -= 15;
   };
 
-  // --- Transactions table ---
+  // --- Profit & Loss summary ---
+  // A simple two-column statement: account name on the left, amount on the right.
 
-  const tEdges = [margin, 112, 298, 384, 470, right];
-  const tLabels = [
-    ['Date', 'left'],
-    ['Description', 'left'],
-    ['Gross Charges', 'center'],
-    ['Expenses', 'center'],
-    ['Revenue Reduction', 'center']
-  ];
-
-  beginPage();
-  txt += pdfText(margin, y, 'TRANSACTIONS', 11);
-  y -= 10;
-  tableHeader(tEdges, tLabels);
-
-  statementRecordsSorted(d).forEach((r, i) => {
-    // On a new page, repeat the column titles
-    if (y - 20 < 42) {
-      finishPage();
-      beginPage();
-      tableHeader(tEdges, tLabels);
-    }
-
-    const row = statementRow(r);
-    tableRow(tEdges, i, [
-      [dateFmt(row.date), 'left'],
-      [row.desc, 'left'],
-      [row.gross ? money(row.gross) : '', 'right'],
-      [row.exp ? money(row.exp) : '', 'right'],
-      [row.red ? money(row.red) : '', 'right']
-    ]);
-  });
-
-  // --- Revenue summary ---
-
-  // A label on the left, an amount right-aligned at the margin
-  const summaryLine = (label, value, valueSize = 9) => {
-    txt += pdfText(margin, y, label, 9);
-    txt += pdfTextRight(right, y, money(value), valueSize);
+  // Gray band naming a section (INCOME / EXPENSES)
+  const plBand = label => {
+    ensure(34);
+    gfx += pdfRect(margin, y - 4, usable, 14, HEADER_GRAY);
+    txt += pdfText(margin + cellPad, y, label.toUpperCase(), 8);
+    y -= 15;
   };
 
-  y -= 5;
-  ensure(60);
-  separator();
-  y -= 18;
+  // One line. `indent` for line items; `rule` draws a line above (totals);
+  // `heavy` makes it a thicker rule and a bigger font (the bottom line).
+  const plLine = (label, value, { indent = false, rule = false, heavy = false } = {}) => {
+    ensure(20);
+    const size = heavy ? 11 : 9;
+    if (rule) gfx += pdfLine(margin, y + 10, right, y + 10, heavy ? .9 : .5);
+    txt += pdfText(margin + cellPad + (indent ? 12 : 0), y, label, size);
+    if (value !== null) txt += pdfTextRight(amountRight, y, moneyAcct(value), size);
+    y -= heavy ? 17 : 14;
+  };
 
-  txt += pdfText(margin, y, 'REVENUE SUMMARY', 11);
-  y -= 17;
-  summaryLine('Gross Charges', d.gross);
-  y -= 14;
-  summaryLine('Revenue Reduction', d.reduction);
-  y -= 14;
-  summaryLine('Net Revenue', d.gross - d.reduction);
-  y -= 23;
+  beginPage();
+  txt += pdfText(margin, y, 'PROFIT & LOSS', 11);
+  y -= 16;
 
-  // --- Expenses by category ---
+  plBand('Income');
+  if (d.incomeLines.length) {
+    d.incomeLines.forEach(([name, amount]) => plLine(name, amount, { indent: true }));
+  } else {
+    plLine('No income in this period.', null, { indent: true });
+  }
+  plLine('Total Charges', d.gross, { rule: true });
+  plLine('Less: Adjustments', -d.reduction, { indent: true });
+  plLine('Net Revenue', d.netRevenue, { rule: true });
+  y -= 6;
+
+  const expenseSets = expenseGroups(d.expenses);
+  plBand('Expenses');
+  if (expenseSets.length) {
+    expenseSets.forEach(([name, items]) => plLine(name, sumAmounts(items), { indent: true }));
+  } else {
+    plLine('No expenses in this period.', null, { indent: true });
+  }
+  plLine('Total Expenses', d.exp, { rule: true });
+  y -= 6;
+  plLine('Net Income', d.net, { rule: true, heavy: true });
+
+  // Claims billed but not yet paid are not part of cash-basis income; mention them as a memo
+  ensure(30);
+  txt += pdfText(margin + cellPad, y,
+    d.outstanding.count
+      ? `Memo: ${d.outstanding.count} claim${d.outstanding.count === 1 ? '' : 's'} billed but unpaid as of ${dateFmt(to)}: ${money(d.outstanding.amount)} (not included above)`
+      : `Memo: no insurance claims were outstanding as of ${dateFmt(to)}`,
+    7.5);
+  y -= 26;
+
+  // --- Expense detail, one table per category ---
 
   const eEdges = [margin, 112, 470, right];
   const eLabels = [
@@ -1386,71 +1837,103 @@ function generatePDF(from, to) {
     }
   };
 
-  txt += pdfText(margin, y, 'EXPENSES BY CATEGORY', 11);
-  y -= 17;
+  if (expenseSets.length) {
+    ensure(100);
+    separator();
+    y -= 18;
+    txt += pdfText(margin, y, 'EXPENSE DETAIL', 11);
+    y -= 17;
 
-  for (const [category, items] of expenseGroups(d.expenses)) {
-    ensure(70);
-    categoryHeader(category);
+    for (const [category, items] of expenseSets) {
+      ensure(70);
+      categoryHeader(category);
 
-    items
-      .sort((a, b) => a.date.localeCompare(b.date))
-      .forEach((r, i) => {
-        ensureInCategory(category, 18);
-        tableRow(eEdges, i, [
-          [dateFmt(r.date), 'left'],
-          [r.description || category, 'left'],
-          [money(r.amount), 'right']
-        ]);
-      });
+      items
+        .sort((a, b) => a.date.localeCompare(b.date))
+        .forEach((r, i) => {
+          ensureInCategory(category, 18);
+          tableRow(eEdges, i, [
+            [dateFmt(r.date), 'left'],
+            [r.description || category, 'left'],
+            [money(r.amount), 'right']
+          ]);
+        });
 
-    // Category total row (not shaded), with a heavier line above it
-    ensureInCategory(category, 18);
-    gfx += pdfLine(margin, y + 11, right, y + 11, .8);
-    columnRules(eEdges, y - 4, 15);
-    cell(eEdges, 1, 'Category Total', 'left', 8, y);
-    cell(eEdges, 2, money(items.reduce((sum, r) => sum + Number(r.amount), 0)), 'right', 8, y);
-    y -= 29;
+      // Category total row (not shaded), with a heavier line above it
+      ensureInCategory(category, 18);
+      gfx += pdfLine(margin, y + 11, right, y + 11, .8);
+      columnRules(eEdges, y - 4, 15);
+      cell(eEdges, 1, 'Category Total', 'left', 8, y);
+      cell(eEdges, 2, money(sumAmounts(items)), 'right', 8, y);
+      y -= 29;
+    }
   }
 
-  // --- Final statement summary ---
+  // --- Transaction listing (last, as supporting detail) ---
 
-  ensure(105);
-  separator();
-  y -= 20;
-  txt += pdfText(margin, y, 'STATEMENT SUMMARY', 11);
-  y -= 18;
-
-  const summary = [
-    ['Gross Charges', d.gross],
-    ['Revenue Reduction', d.reduction],
-    ['Net Revenue', d.gross - d.reduction],
-    ['Total Expenses', d.exp],
-    ['NET INCOME', d.net]
+  const tEdges = [margin, 112, 298, 384, 470, right];
+  const tLabels = [
+    ['Date', 'left'],
+    ['Description', 'left'],
+    ['Charges', 'center'],
+    ['Expenses', 'center'],
+    ['Adjustment', 'center']
   ];
 
-  for (const [label, value] of summary) {
-    if (label === 'NET INCOME') {
-      gfx += pdfLine(margin, y + 5, W - margin, y + 5);
-      y -= 8;
-    }
-    summaryLine(label, value, label === 'NET INCOME' ? 11 : 9);
-    y -= 16;
+  ensure(100);
+  separator();
+  y -= 18;
+  txt += pdfText(margin, y, 'TRANSACTION LISTING', 11);
+  y -= 10;
+  tableHeader(tEdges, tLabels);
+
+  const listing = statementRecordsSorted(d);
+  if (!listing.length) {
+    txt += pdfText(margin + cellPad, y, 'No transactions in this period.', 8);
+    y -= 15;
   }
 
+  listing.forEach((r, i) => {
+    // On a new page, repeat the column titles
+    if (y - 20 < 42) {
+      finishPage();
+      beginPage();
+      tableHeader(tEdges, tLabels);
+    }
+
+    const row = statementRow(r);
+    tableRow(tEdges, i, [
+      [dateFmt(row.date), 'left'],
+      [row.desc, 'left'],
+      [row.gross ? money(row.gross) : '', 'right'],
+      [row.exp ? money(row.exp) : '', 'right'],
+      [row.red ? money(row.red) : '', 'right']
+    ]);
+  });
+
   finishPage();
+
+  // --- Page footers (added last, when the page count is known) ---
+
+  const streams = pages.map((p, i) => {
+    const footerText =
+      pdfText(margin, 24, `Prepared ${dateFmt(today())}`, 8) +
+      pdfTextRight(right, 24, `Page ${i + 1} of ${pages.length}`, 8);
+    const footerLine = pdfLine(margin, 36, right, 36, .4, .6);
+    return `${p.gfx}${footerLine}BT\n${p.txt}${footerText}ET`;
+  });
 
   // --- Assemble the PDF file structure ---
   // Object layout: 1 = catalog, 2 = page list, then (page, content) pairs, last = font.
 
   const objects = [];
   const pageRefs = [];
-  const fontObjNumber = 3 + pages.length * 2;
+  const fontObjNumber = 3 + streams.length * 2;
 
   objects.push('<< /Type /Catalog /Pages 2 0 R >>');   // object 1
   objects.push('');                                    // object 2 (filled in below)
 
-  pages.forEach((stream, i) => {
+  streams.forEach((stream, i) => {
     const pageObj = 3 + i * 2;
     const contentObj = 4 + i * 2;
     pageRefs.push(`${pageObj} 0 R`);
@@ -1459,7 +1942,7 @@ function generatePDF(from, to) {
     objects.push(`<< /Length ${stream.length} >>\nstream\n${stream}\nendstream`);
   });
 
-  objects[1] = `<< /Type /Pages /Kids [${pageRefs.join(' ')}] /Count ${pages.length} >>`;
+  objects[1] = `<< /Type /Pages /Kids [${pageRefs.join(' ')}] /Count ${streams.length} >>`;
   objects.push('<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>');
 
   // Write each object and remember its byte offset for the cross-reference table
@@ -1482,7 +1965,7 @@ function generatePDF(from, to) {
 
 
 /* ==========================================================================
-   14. Startup
+   15. Startup
    ========================================================================== */
 
 (async () => {
@@ -1491,12 +1974,12 @@ function generatePDF(from, to) {
   records = await getAll();
   await migrateCategories();
 
-  // Default statement range: first of this month through today
-  const now = new Date();
-  const firstOfMonth = new Date(now.getFullYear(), now.getMonth(), 1);
-  $('statementFrom').value = firstOfMonth.toISOString().slice(0, 10);
-  $('statementThrough').value = today();
+  // Both the Register and Statements start on the current month
+  populatePeriodSelects();
+  setPeriod('registerPeriod', 'thisMonth');
+  setPeriod('statementPeriod', 'thisMonth');
 
+  showLastSync();
   refresh();
 
   // Register the service worker for offline use
