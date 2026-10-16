@@ -9,7 +9,7 @@ const CACHE_NAME = 'tfp-ledger-v1.0.7';
 const APP_SHELL = [
   './',
   './index.html',
-  './manifest.webmanifest',
+  './manifest.json',
   './css/style.css',
   './js/app.js',
   './app-icons/app-icon-192.png',
